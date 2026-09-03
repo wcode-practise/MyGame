@@ -1,6 +1,7 @@
 # 修仙世界 · 第一版技术规格说明书（SPEC）
 
-- 文档版本：v1.0
+- 文档版本：v1.1（技术栈由 Go 切换为 Python）
+- 变更记录：v1.0 初始 Go 版；v1.1 按用户决定改用 Python 实现，玩法规则、数据库与结算算法不变
 - 对应需求源：`Order.md`
 - 适用范围：当前仓库 `/home/wyh/project/MyGame`
 - 开发原则：**逐个版本迭代开发，每个版本可运行、可测试、可存档；未提及的功能后续以“新增属性/方法/配置”的方式扩展，不推翻现有结构。**
@@ -26,12 +27,12 @@
 - 不移动时世界暂停；服务器关闭时世界暂停，重新启动后从存档继续。
 - 第一版优先通过 VSCode 运行和测试，部署问题后续再议。
 
-### 1.3 架构选型：经典结构体 + 接口（方案 A）
+### 1.3 架构选型：经典类 + 抽象接口（方案 A，Python 实现）
 
-本版**不采用 ECS**，采用用户确认的方案 A：
+本版**不采用 ECS**，采用用户确认的方案 A，并使用 Python 实现：
 
-- `Person`、`Action`、`Tile`、`Region`、`Simulator` 等均为普通 Go 结构体；
-- Go 没有继承，使用**组合（embedding）+ 接口**替代继承；
+- `Person`、`Action`、`Tile`、`Region`、`Simulator` 等均为普通 Python 类，数据类优先使用 `@dataclass`；
+- 继承只用于“接口契约”：动作类统一实现 `Action` 抽象基类，Region 子类、AI 策略、前端实现通过接口扩展；
 - 每个动作类实现同一个 `Action` 接口；
 - Region 后续子类（城市、修炼区域、普通区域）通过 `kind` 字段 + 接口扩展，不修改原有 Map/Tile 逻辑；
 - 后续若某个类属性爆炸，再对局部做组件化重构，对外接口保持不变。
@@ -42,7 +43,7 @@
 
 | 编号 | 决策 | 说明 |
 |---|---|---|
-| D1 | 组织方式 | 经典结构体 + 接口，不用 ECS |
+| D1 | 组织方式 | Python 经典类 + 抽象接口，不用 ECS |
 | D2 | 世界时间推进 | 玩家移动 1 格 = 世界推进 1 个月 = 模拟器结算 1 次；不移动则世界暂停 |
 | D3 | 月内精度 | 每次月结算内部按 **30 天逐日回放**；年=12月，月=30天 |
 | D4 | 日结算顺序 | 当天动作 → 延寿事件按生效日应用 → 年龄+1天 → 死亡检查（死亡最后判定） |
@@ -55,7 +56,7 @@
 | D11 | 数据库 | SQLite 单文件存档，WAL + synchronous=FULL + 外键 + 自动备份，关键数据不丢 |
 | D12 | 时间比例 | 第一版为纯回合制：世界时间只随移动推进，不按现实时间推进；`time_scale` 字段预留但默认不启用 |
 | D13 | 存档 | 单存档；关服暂停、重启续档；第一版无离线收益（离线收益以后通过现实时间补算开放） |
-| D14 | 并发 | 所有世界状态只能由模拟器这一条 goroutine 修改；LLM 调用可异步，但只能向模拟器提交“动作提案” |
+| D14 | 并发 | 所有世界状态只能由模拟器这一个异步任务（asyncio 单线程事件循环）修改；LLM 调用可异步，但只能向模拟器提交“动作提案” |
 | D15 | NPC | 初始 30 个 NPC，人口上限 100；每年出生、每月规则 AI 决策 |
 | D16 | 世界事件 | 第一版固定每 6 个游戏月触发一次；以后按 Region 属性与随机时间扩展 |
 | D17 | 玩家寿终 | 进入“大限将至”状态：不能修炼、不能突破，存档保留，可 GM 回滚；第一版无转世 |
@@ -90,25 +91,27 @@
 
 | 项目 | 选择 | 理由 |
 |---|---|---|
-| 语言 | Go 1.22+ | 用户指定；单二进制部署 |
-| 数据库 | SQLite | 单机单存档；`modernc.org/sqlite` 为纯 Go 驱动，VSCode/Windows 下无需 CGO |
-| 配置格式 | YAML | `gopkg.in/yaml.v3` |
+| 语言 | Python 3.12+ | 用户熟悉，开发迭代最快；当前单机回合制规模完全无性能压力 |
+| 数据库 | SQLite | 标准库 `sqlite3` 内置，零额外依赖；单文件存档 |
+| 配置格式 | YAML | `PyYAML`，与 Python dict 天然对应 |
 | 文本文件 | UTF-8 TXT | 自写 IO 工具，见第 11 节 |
-| HTTP（预留） | Go 标准库 `net/http` | Go 1.22 的 ServeMux 已支持方法匹配与路径参数，第一版不引入 Web 框架 |
-| 日志 | 标准库 `log/slog` | 结构化日志 |
-| 随机数 | `math/rand/v2` | 世界种子可复现 |
-| 资源打包 | `embed.FS` | 配置、名称表、提示词模板打进二进制 |
-| 测试 | 标准库 `testing` | 单元测试 + 模拟器集成测试 |
-| LLM（预留） | `net/http` + `encoding/json` | 兼容 DeepSeek（OpenAI 格式）接口 |
+| HTTP（预留） | Python 标准库 `http.server`（v0.5） | 第一版不引入 Web 框架；以后需要时再评估 FastAPI |
+| 并发/异步 | 标准库 `asyncio` | 单线程事件循环；模拟器为唯一写者；LLM 用 `asyncio.to_thread` 异步化 |
+| 日志 | 标准库 `logging` | 分级日志 |
+| 随机数 | 标准库 `random.Random(seed)` | 世界种子可复现 |
+| 资源打包 | 普通 `configs/`、`assets/` 目录读取 | 第一版不追求单二进制；后期可用 PyInstaller 打包 |
+| 测试 | 标准库 `unittest` 或 `pytest`（开发依赖） | 单元测试 + 模拟器集成测试 |
+| LLM（预留） | `urllib.request`（在 asyncio 线程池中调用）+ `json` | 兼容 DeepSeek（OpenAI 格式）接口 |
 
 **第一版依赖清单：**
 
-```
-modernc.org/sqlite
-gopkg.in/yaml.v3
+```text
+Python 3.12+
+PyYAML            # 运行时唯一第三方依赖
+pytest            # 仅开发测试用（可选）
 ```
 
-其余全部使用 Go 标准库。后续若需要 WebSocket、MongoDB、Redis 等，再按版本引入，不提前引入。
+其余全部使用 Python 标准库。后续若需要 WebSocket、FastAPI、MongoDB、Redis 等，再按版本引入，不提前引入。
 
 ---
 
@@ -119,13 +122,14 @@ gopkg.in/yaml.v3
 ```text
 第一版推荐运行方式（VSCode 内）：
   cd /home/wyh/project/MyGame
-  go run ./cmd/game
+  python -m mygame
+  # 或：python main.py
 
 程序启动后：
-  1. 加载内嵌配置并校验；
+  1. 加载 configs/ 配置并校验；
   2. 打开 SQLite（不存在则初始化并生成世界）；
   3. 恢复世界时间、人物、地图实体、动作队列；
-  4. 启动模拟器 goroutine；
+  4. 启动 asyncio 事件循环并创建模拟器异步任务；
   5. 进入终端文字菜单循环。
 ```
 
@@ -133,10 +137,10 @@ gopkg.in/yaml.v3
 
 | 参数 | 作用 |
 |---|---|
-| `-http :8080` | 额外启动 HTTP API（为 GM 与后续图形前端预留） |
-| `-gm` | 启动后直接进入 GM 菜单 |
-| `-config ./configs` | 使用外部配置目录覆盖内嵌配置（预留） |
-| `-db ./data/save.db` | 指定存档路径 |
+| `--http :8080` | 额外启动 HTTP API（为 GM 与后续图形前端预留） |
+| `--gm` | 启动后直接进入 GM 菜单 |
+| `--config ./configs` | 指定配置目录（默认 `./configs`） |
+| `--db ./data/save.db` | 指定存档路径 |
 
 ### 5.2 进程内数据流
 
@@ -148,7 +152,7 @@ gopkg.in/yaml.v3
         │
         ▼
 ┌────────────────────────────────┐
-│   Simulator（唯一写 goroutine）  │
+│   Simulator（唯一写者异步任务）  │
 │  1. 校验动作合法性               │
 │  2. 推进 1 个月（内部 30 天）     │
 │  3. 月末钩子（世界事件/出生）     │
@@ -162,21 +166,22 @@ gopkg.in/yaml.v3
 
 ### 5.3 并发规则（“协程化机制”的正确实现）
 
-用户要求“动作可以异步实现，实行协程化机制”，同时要求“所有结算操作都在模拟器中进行”。两者结合后的规则：
+用户要求“动作可以异步实现，实行协程化机制”，同时要求“所有结算操作都在模拟器中进行”。Python 版采用 **asyncio 单线程事件循环 + 单写者** 实现：
 
-1. **世界状态单写者**：模拟器 goroutine 是唯一允许修改 `WorldState` 的 goroutine。
-2. **长动作不靠 goroutine 计时**：动作是状态机 `waiting → running → done/cancelled/interrupted`，进度存在 `ActionQueueEntry` 中，由模拟器在日循环中推进。这样“等待 30 天”不会占用任何常驻计时 goroutine。
+1. **世界状态单写者**：模拟器是事件循环中唯一允许修改 `WorldState` 的异步任务。
+2. **长动作不靠线程/定时器驱动**：动作是状态机 `waiting → running → done/cancelled/interrupted`，进度存在 `ActionQueueEntry` 中，由模拟器在日循环中推进。这样“等待 30 天”不会占用任何线程或定时器。
 3. **允许异步的部分**：
-   - LLM 请求在独立 goroutine 中执行，超时后返回或放弃；
-   - LLM 只能返回“动作提案”，模拟器通过 `CanExecute` 校验后才入队；
-   - 终端/HTTP 的请求 goroutine 只向模拟器发送 Command，不直接改状态。
-4. **查询并发**：其他 goroutine 通过模拟器提供的 `Snapshot()` 读取不可变快照，不直接读写内部状态。
-5. **关服安全**：`Shutdown` 命令会让模拟器完成当前结算、强制落盘后退出。
+   - LLM 请求通过 `asyncio.to_thread` 放到线程池执行，超时或失败返回后由模拟器继续处理；
+   - LLM 只能返回“动作提案”，模拟器通过 `can_execute()` 校验后才入队；
+   - 终端输入/HTTP 请求通过 `asyncio.Queue` 向模拟器发送 Command，不直接改状态。
+4. **查询**：外部只读取 `snapshot()` 返回的不可变快照，不直接访问模拟器内部状态。
+5. **关服安全**：收到 `Shutdown` 命令后，模拟器完成当前结算、强制落盘，再停止事件循环。
+6. **禁止事项**：模拟器结算过程不得中途 `await` 打断月结算；LLM/IO 的异步结果只能在结算开始前或结束后被消费。
 
 ```text
-请求 goroutine ──Command──► 模拟器 goroutine ──事务──► SQLite
-LLM goroutine ──ActionProposal──► 模拟器 goroutine（校验后入队）
-查询 goroutine ──SnapshotRequest──► 模拟器 goroutine ──Snapshot──► 查询 goroutine
+终端/HTTP 请求 ──asyncio.Queue──► 模拟器异步任务 ──事务──► SQLite
+LLM 线程池 ──ActionProposal──► 模拟器异步任务（校验后入队）
+查询方 ──SnapshotRequest──► 模拟器异步任务 ──Snapshot──► 查询方
 ```
 
 ---
@@ -187,96 +192,108 @@ LLM goroutine ──ActionProposal──► 模拟器 goroutine（校验后入�
 MyGame/
 ├── Order.md                         # 需求原始文件
 ├── SPEC.md                          # 本文件
-├── go.mod
-├── go.sum
-├── cmd/
-│   └── game/
-│       └── main.go                  # 程序入口：终端 + 可选 HTTP
-├── internal/
-│   ├── app/
-│   │   └── app.go                   # 依赖装配、启动/关闭流程
+├── main.py                          # 程序入口：python main.py
+├── requirements.txt                 # PyYAML
+├── requirements-dev.txt             # pytest（可选）
+├── pyproject.toml                   # 项目元数据与 pytest 配置（可选）
+├── .gitignore                       # data/、__pycache__/ 等
+├── mygame/
+│   ├── __init__.py
+│   ├── __main__.py                  # 支持 python -m mygame
+│   ├── app.py                       # 依赖装配、启动/关闭流程
+│   ├── idgen.py                     # ID 类
+│   ├── namegen.py                   # 名称文件加载与随机姓名
 │   ├── world/
-│   │   ├── map.go                   # Map：统一管理 Tile/Region/寻路/边界
-│   │   ├── tile.go                  # Tile 类
-│   │   ├── region.go                # Region 类 + kind 分发
-│   │   ├── shape.go                 # Shape 接口 + rect/circle/polygon
-│   │   └── generation.go            # 按 world.yaml 生成地图、校验覆盖
+│   │   ├── __init__.py
+│   │   ├── map.py                   # Map：统一管理 Tile/Region/寻路/边界
+│   │   ├── tile.py                  # Tile 类
+│   │   ├── region.py                # Region 类 + kind 分发
+│   │   ├── shape.py                 # Shape 接口 + rect/circle/polygon
+│   │   └── generation.py            # 按 world.yaml 生成地图、校验覆盖
 │   ├── person/
-│   │   ├── person.go                # 人物类（玩家与 NPC 统一）
-│   │   └── history.go               # 最近 5 条动作记录（传记）
+│   │   ├── __init__.py
+│   │   ├── person.py                # 人物类（玩家与 NPC 统一）
+│   │   └── history.py               # 最近 5 条动作记录（传记）
 │   ├── action/
-│   │   ├── action.go                # Action 接口、队列条目、进度百分比
-│   │   ├── registry.go              # 动作注册表（新增动作只在此注册）
-│   │   ├── move.go                  # 移动动作
-│   │   ├── cultivate.go             # 修炼动作
-│   │   ├── breakthrough.go          # 突破动作
-│   │   ├── entertain.go             # 娱乐动作
-│   │   ├── hunt.go                  # 狩猎动作
-│   │   ├── gather.go                # 采集动作
-│   │   └── emotion.go               # 情绪动作
+│   │   ├── __init__.py
+│   │   ├── base.py                  # Action 抽象基类、队列条目、进度百分比
+│   │   ├── registry.py              # 动作注册表（新增动作只在此注册）
+│   │   ├── move.py                  # 移动动作
+│   │   ├── cultivate.py             # 修炼动作
+│   │   ├── breakthrough.py          # 突破动作
+│   │   ├── entertain.py             # 娱乐动作
+│   │   ├── hunt.py                  # 狩猎动作
+│   │   ├── gather.py                # 采集动作
+│   │   └── emotion.py               # 情绪动作
 │   ├── gametime/
-│   │   ├── year.go                  # 年类
-│   │   ├── month.go                 # 月类
-│   │   ├── day.go                   # 日类
-│   │   ├── timestamp.go             # 时间戳类：年-月-日
-│   │   └── calendar.go              # day_index 与年/月/日互转
+│   │   ├── __init__.py
+│   │   ├── year.py                  # 年类
+│   │   ├── month.py                 # 月类
+│   │   ├── day.py                   # 日类
+│   │   ├── timestamp.py             # 时间戳类：年-月-日
+│   │   └── calendar.py              # day_index 与年/月/日互转
 │   ├── simulator/
-│   │   ├── simulator.go             # 模拟器类：单写者、Command 通道
-│   │   ├── settlement.go            # 月结算 = 30 天日循环 + 月末钩子
-│   │   ├── lifespan.go              # 延寿事件字典应用与死亡判定
-│   │   ├── checkpoint.go            # 存档检查点与事务提交
-│   │   └── command.go               # Command/Result/Snapshot 类型
+│   │   ├── __init__.py
+│   │   ├── simulator.py             # 模拟器类：单写者、asyncio 队列
+│   │   ├── settlement.py            # 月结算 = 30 天日循环 + 月末钩子
+│   │   ├── lifespan.py              # 延寿事件字典应用与死亡判定
+│   │   ├── checkpoint.py            # 存档检查点与事务提交
+│   │   └── command.py               # Command/Result/Snapshot 类型
 │   ├── cultivation/
-│   │   ├── realm.go                 # 修仙等级类
-│   │   ├── linggen.go               # 灵根类（五行占比）
-│   │   ├── technique.go             # 功法（本版读配置）
-│   │   └── formula.go               # 修炼/突破公式（配置驱动）
+│   │   ├── __init__.py
+│   │   ├── realm.py                 # 修仙等级类
+│   │   ├── linggen.py               # 灵根类（五行占比）
+│   │   ├── technique.py             # 功法（本版读配置）
+│   │   └── formula.py               # 修炼/突破公式（配置驱动）
 │   ├── ecology/
-│   │   ├── animal.go                # 动物类
-│   │   ├── plant.go                 # 植物类
-│   │   └── growth.go                # 生长/重生推进
+│   │   ├── __init__.py
+│   │   ├── animal.py                # 动物类
+│   │   ├── plant.py                 # 植物类
+│   │   └── growth.py                # 生长/重生推进
 │   ├── item/
-│   │   ├── item.go                  # Item 类（模板 + 实例）
-│   │   └── spiritstone.go           # 灵石类（独立货币）
+│   │   ├── __init__.py
+│   │   ├── item.py                  # Item 类（模板 + 实例）
+│   │   └── spiritstone.py           # 灵石类（独立货币）
 │   ├── event/
-│   │   ├── event.go                 # 事件类（世界记录）
-│   │   ├── template.go              # 事件模板
-│   │   └── log.go                   # 事件写入 event_log
+│   │   ├── __init__.py
+│   │   ├── event.py                 # 事件类（世界记录）
+│   │   ├── template.py              # 事件模板
+│   │   └── log.py                   # 事件写入 event_log
 │   ├── ai/
-│   │   ├── ai.go                    # NPC AI 接口
-│   │   ├── rule.go                  # 规则类 AI
-│   │   └── llm.go                   # LLM 类 AI（动作链 + 突发状况）
+│   │   ├── __init__.py
+│   │   ├── base.py                  # NPC AI 接口
+│   │   ├── rule.py                  # 规则类 AI
+│   │   └── llm.py                   # LLM 类 AI（动作链 + 突发状况）
 │   ├── personality/
-│   │   └── personality.go           # 角色性格类（五维）
-│   ├── idgen/
-│   │   └── idgen.go                 # ID 类
+│   │   └── personality.py           # 角色性格类（五维）
 │   ├── config/
-│   │   ├── loader.go                # 配置文件类：YAML 边界导入
-│   │   ├── validate.go              # 边界/引用/数值校验
-│   │   ├── embed.go                 # embed.FS 入口
-│   │   └── types.go                 # 配置结构体定义
-│   ├── namegen/
-│   │   └── namegen.go               # 名称文件加载与随机姓名
-│   ├── io/
-│   │   └── textfile.go              # IO 文件：只读 UTF-8 TXT
+│   │   ├── __init__.py
+│   │   ├── loader.py                # 配置文件类：YAML 导入
+│   │   ├── validate.py              # 边界/引用/数值校验
+│   │   └── types.py                 # 配置结构体（dataclass）定义
+│   ├── io_utils/
+│   │   └── textfile.py              # IO 文件：只读 UTF-8 TXT
 │   ├── llmclient/
-│   │   └── deepseek.go              # DeepSeek 异步调用（预留）
+│   │   └── deepseek.py              # DeepSeek 异步调用（预留）
 │   ├── store/
-│   │   ├── sqlite.go                # 连接、PRAGMA、事务
-│   │   ├── migrations.go            # 迁移执行
-│   │   ├── backup.go                # 自动备份
-│   │   ├── repo_world.go            # 世界/时间存取
-│   │   ├── repo_person.go           # 人物/动作队列/历史存取
-│   │   ├── repo_ecology.go          # 动物/植物存取
-│   │   ├── repo_item.go             # 物品/灵石存取
-│   │   └── repo_event.go            # 事件日志存取
+│   │   ├── __init__.py
+│   │   ├── sqlite.py                # 连接、PRAGMA、事务
+│   │   ├── migrations.py            # 迁移执行
+│   │   ├── backup.py                # 自动备份
+│   │   ├── repo_world.py            # 世界/时间存取
+│   │   ├── repo_person.py           # 人物/动作队列/历史存取
+│   │   ├── repo_ecology.py          # 动物/植物存取
+│   │   ├── repo_item.py             # 物品/灵石存取
+│   │   └── repo_event.py            # 事件日志存取
 │   ├── frontend/
-│   │   ├── terminal.go              # 前端类：终端文字客户端
-│   │   ├── menu.go                  # 菜单与输入处理
-│   │   └── render.go                # ASCII 地图与状态渲染
+│   │   ├── __init__.py
+│   │   ├── terminal.py              # 前端类：终端文字客户端
+│   │   ├── menu.py                  # 菜单与输入处理
+│   │   └── render.py                # ASCII 地图与状态渲染
 │   └── server/
-│       ├── http.go                  # HTTP API（预留）
-│       └── gm.go                    # GM 管理接口（预留）
+│       ├── __init__.py
+│       ├── http.py                  # HTTP API（预留）
+│       └── gm.py                    # GM 管理接口（预留）
 ├── configs/
 │   ├── world.yaml                   # 地图、Region、Shape、灵气、出生点
 │   ├── realms.yaml                  # 境界、寿元、突破公式
@@ -315,92 +332,99 @@ MyGame/
 
 ### 7.1 人物类 `Person`
 
-- 文件：`internal/person/person.go`
-- 玩家与 NPC 统一使用 `Person`，通过 `Kind` 区分；玩家额外属性放 `extra_json`，NPC 决策由 `ai.Controller` 负责。
+- 文件：`mygame/person/person.py`
+- 玩家与 NPC 统一使用 `Person`，通过 `kind` 区分；玩家额外属性放 `extra`，NPC 决策由 `ai.Controller` 负责。
 
-```go
-type Kind string // "player" | "npc"
+```python
+from dataclasses import dataclass, field
 
-type Person struct {
-    ID             string          // P0001 / N0001
-    Kind           Kind
-    Name           string
-    Gender         string          // male | female
-    BirthDayIndex  int             // 出生日（day_index）
-    AgeDays        int             // 年龄（天），内部权威值
-    Alive          bool
-    DeathDayIndex  int             // 死亡日；未死亡为 -1
-    PosX, PosY     int
-    RealmID        string          // lianqi / zhuji / jindan / yuanying
-    StageIndex     int             // 0 初期 1 中期 2 后期 3 圆满
-    ProgressPercent float64        // 当前小层修为进度 0-100
-    TechniqueID    string
-    BaseLifespanDays int           // 当前境界基础寿元快照
-    Mood           float64         // 0-100
-    SpiritRoot     cultivation.LingGen
-    Personality    personality.Personality
-    Status         Status          // 轻伤/突破冷却等，序列化为 status_json
-    ActionQueue    *action.Queue
-    History        *History        // 最近 5 条动作记录
-    Stones         item.SpiritStones
-    Items          []*item.Instance
-    Extra          map[string]any // extra_json，后续新属性先放这里
-}
+@dataclass
+class Person:
+    id: str                       # P0001 / N0001
+    kind: str                     # "player" | "npc"
+    name: str
+    gender: str                   # "male" | "female"
+    birth_day_index: int          # 出生日（day_index）
+    age_days: int = 0             # 年龄（天），内部权威值
+    alive: bool = True
+    death_day_index: int | None = None
+    pos_x: int = 0
+    pos_y: int = 0
+    realm_id: str = "lianqi"      # lianqi / zhuji / jindan / yuanying
+    stage_index: int = 0          # 0 初期 1 中期 2 后期 3 圆满
+    progress_percent: float = 0.0 # 当前小层修为进度 0-100
+    technique_id: str | None = None
+    base_lifespan_days: int = 36000  # 当前境界基础寿元快照
+    mood: float = 80.0            # 0-100
+    spirit_root: LingGen = field(default_factory=LingGen)
+    personality: Personality = field(default_factory=Personality)
+    status: Status = field(default_factory=Status)  # 轻伤/突破冷却等，序列化为 status_json
+    action_queue: ActionQueue = field(default_factory=ActionQueue)
+    history: History = field(default_factory=History)  # 最近 5 条动作记录
+    stones: int = 0               # 灵石独立存放
+    items: list[ItemInstance] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)  # extra_json，后续新属性先放这里
 ```
 
 **方法（第一版必须实现）：**
 
 | 方法 | 说明 |
 |---|---|
-| `AgeString()` | 年龄按“X年X月X天”显示 |
-| `GetCultivationProgress()` | 获取修仙进度（境界/小层/百分比） |
-| `IsOldAndDead(currentDay int)` | 是否因寿元耗尽死亡（见寿命类） |
-| `CurrentLifespanDays(currentDay int)` | 基础寿元 + 已生效延寿事件之和 |
-| `GetActionHistory(limit int)` | 获取历史动作，默认最近 5 条 |
-| `CanDo(act)` | 调用动作的 `CanExecute` 做合法性判断 |
-| `QueueAction(act)` | 向动作队列追加动作 |
-| `AddLifespanEvent(...)` | 添加一条延寿事件（写字典） |
-| `ApplyDeath(day, reason)` | 玩家保留存档置死；NPC 移除 |
-| `SetSpiritRoot(...)` | 仅新建人物时允许调用 |
+| `age_string()` | 年龄按“X年X月X天”显示 |
+| `get_cultivation_progress()` | 获取修仙进度（境界/小层/百分比） |
+| `is_old_and_dead(current_day)` | 是否因寿元耗尽死亡（见寿命类） |
+| `current_lifespan_days(current_day)` | 基础寿元 + 已生效延寿事件之和 |
+| `get_action_history(limit=5)` | 获取历史动作，默认最近 5 条 |
+| `can_do(act)` | 调用动作的 `can_execute()` 做合法性判断 |
+| `queue_action(act)` | 向动作队列追加动作 |
+| `add_lifespan_event(...)` | 添加一条延寿事件（写字典） |
+| `apply_death(day, reason)` | 玩家保留存档置死；NPC 移除 |
+| `set_spirit_root(...)` | 仅新建人物时允许调用 |
 
 **约束：**
-- `Kind == player` 在系统中只能有一个；
-- NPC 死亡后实体移除，玩家死亡后实体保留（`Alive=false`）。
+- `kind == "player"` 在系统中只能有一个；
+- NPC 死亡后实体移除，玩家死亡后实体保留（`alive=False`）。
 
 ---
 
 ### 7.2 动作类 `Action`
 
-- 文件：`internal/action/action.go`
-- 所有动作实现同一接口；新增动作 = 新文件 + 在 `registry.go` 注册一行，不改旧代码。
+- 文件：`mygame/action/base.py`
+- 所有动作实现同一抽象基类；新增动作 = 新文件 + 在 `registry.py` 注册一行，不改旧代码。
 
-```go
-type Kind string // "physical" 实际动作 | "emotion" 情绪动作
+```python
+from abc import ABC, abstractmethod
 
-type Action interface {
-    Type() string                       // move/cultivate/breakthrough/entertain/hunt/gather/emotion_xxx
-    Kind() Kind
-    DurationDays() int                  // 0 = 即时
-    CanExecute(ctx *SimContext, p *person.Person) error
-    OnStart(ctx *SimContext, p *person.Person) error
-    OnComplete(ctx *SimContext, p *person.Person) error
-    OnInterrupt(ctx *SimContext, p *person.Person, reason string) error
-}
+class Action(ABC):
+    action_type: str = ""   # move/cultivate/breakthrough/entertain/hunt/gather/emotion_xxx
+    kind: str = "physical"  # "physical" 实际动作 | "emotion" 情绪动作
+    duration_days: int = 0  # 0 = 即时
+
+    @abstractmethod
+    def can_execute(self, ctx: SimContext, person: Person) -> None:
+        """不合法时 raise ValueError，合法返回 None"""
+
+    def on_start(self, ctx: SimContext, person: Person) -> None: ...
+    def on_complete(self, ctx: SimContext, person: Person) -> None: ...
+    def on_interrupt(self, ctx: SimContext, person: Person, reason: str) -> None: ...
 ```
 
 **动作队列条目：**
 
-```go
-type QueueEntry struct {
-    PersonID    string
-    Seq         int
-    ActionType  string
-    Params      map[string]any // 例如移动方向、修炼功法
-    TotalDays   int
-    ElapsedDays int
-    State       string         // waiting | running | done | cancelled | interrupted
-}
-func (e *QueueEntry) ProgressPercent() float64 // 未到 100% 不结算
+```python
+@dataclass
+class ActionQueueEntry:
+    person_id: str
+    seq: int
+    action_type: str
+    params: dict = field(default_factory=dict)   # 例如移动方向、修炼功法
+    total_days: int = 0
+    elapsed_days: int = 0
+    state: str = "waiting"   # waiting | running | done | cancelled | interrupted
+
+    def progress_percent(self) -> float:
+        """未到 100% 不结算"""
+        return 100.0 if self.total_days == 0 else self.elapsed_days / self.total_days * 100.0
 ```
 
 **第一版七类动作：**
@@ -415,7 +439,7 @@ func (e *QueueEntry) ProgressPercent() float64 // 未到 100% 不结算
 | `gather` | 实际 | 5 天 | 完成后判定是否采到当前格成熟植物 |
 | `emotion_*` | 情绪 | 0 天 | 即时动作，只改变心情/性格，不改变世界 |
 
-**动作执行条件**（`CanExecute`）在 Go 代码中直接编写函数，第一版检查项包括：
+**动作执行条件**（`can_execute()`）在 Python 代码中直接编写函数，第一版检查项包括：
 - 人物存活、状态正常；
 - 大限将至者不能 `cultivate` / `breakthrough`；
 - 突破需要当前小层为“圆满”且无突破冷却；
@@ -424,51 +448,55 @@ func (e *QueueEntry) ProgressPercent() float64 // 未到 100% 不结算
 - 同一人物同一时刻只有一个动作在运行，其余排队。
 
 **协程化说明：**
-- 长动作通过 `QueueEntry` 状态机 + 模拟器日循环推进，不使用常驻 goroutine 计时；
-- 效果只在 `ProgressPercent == 100%` 时通过 `OnComplete` 结算；
-- 中断/死亡只调用 `OnInterrupt`，不重复结算。
+- 长动作通过 `ActionQueueEntry` 状态机 + 模拟器日循环推进，不使用线程/定时器计时；
+- 效果只在 `progress_percent() == 100.0` 时通过 `on_complete()` 结算；
+- 中断/死亡只调用 `on_interrupt()`，不重复结算。
 
 ---
 
 ### 7.3 Tile 类
 
-- 文件：`internal/world/tile.go`
+- 文件：`mygame/world/tile.py`
 
-```go
-type Tile struct {
-    X        int
-    Y        int
-    RegionID string
-}
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Tile:
+    x: int
+    y: int
+    region_id: str
 ```
 
 - Tile 只记录坐标和所属 Region，不记录地形、灵气等派生数据；
-- 行为合理性（能否进入、能做什么动作）由 `Map.RegionAt(x, y)` 返回的 Region 决定；
+- 行为合理性（能否进入、能做什么动作）由 `Map.region_at(x, y)` 返回的 Region 决定；
 - 后续若要加“地块修饰”（如灵泉眼），通过 `world.yaml` 的 `tile_modifiers` 层或 Region 子类实现，不修改 Tile 结构。
 
 ### 7.4 Region 类与 Shape 类
 
-- 文件：`internal/world/region.go`、`internal/world/shape.go`
+- 文件：`mygame/world/region.py`、`mygame/world/shape.py`
 
-```go
-type RegionKind string // "normal" | "city" | "cultivation" | "ruin"
+```python
+from dataclasses import dataclass, field
+from mygame.world.shape import Shape
 
-type Region struct {
-    ID          string
-    Name        string
-    Kind        RegionKind
-    Shape       Shape
-    AuraBase    float64   // 灵气基础值
-    Danger      int       // 危险度
-    Enterable   bool      // 是否可进入
-    MinRealm    string    // 进入所需最低境界
-    EventPool   []string  // 本区域事件模板 ID
-}
+@dataclass
+class Region:
+    id: str
+    name: str
+    kind: str                  # "normal" | "city" | "cultivation" | "ruin"
+    shape: Shape
+    aura_base: float           # 灵气基础值
+    danger: int                # 危险度
+    enterable: bool = True
+    min_realm: str = "lianqi"
+    event_pool: list[str] = field(default_factory=list)
 
-type Shape interface {
-    Contains(x, y int) bool
-    Bounds() (minX, minY, maxX, maxY int)
-}
+class Shape(ABC):
+    @abstractmethod
+    def contains(self, x: int, y: int) -> bool: ...
+    @abstractmethod
+    def bounds(self) -> tuple[int, int, int, int]: ...
 ```
 
 Shape 实现：
@@ -479,68 +507,72 @@ Shape 实现：
 **约束：**
 - 启动时校验地图每个 Tile 都被恰好一个 Region 覆盖；
 - 第一版禁止 Region 重叠；如重叠，配置校验直接失败（后续可加 priority 字段）；
-- Region 后续子类（城市、修炼区）先通过 `Kind` 分支实现，不写 Go 继承。
+- Region 后续子类（城市、修炼区）先通过 `kind` 分支实现，不写类继承。
 
 ### 7.5 时间类
 
-- 文件：`internal/gametime/*`
+- 文件：`mygame/gametime/`
 
-```go
-type Year  int  // 年类
-type Month int  // 月类，1-12
-type Day   int  // 日类，1-30
+```python
+from typing import NewType
 
-type Timestamp struct { // 时间戳类
-    Year  Year
-    Month Month
-    Day   Day
-}
+Year  = NewType("Year", int)    # 年类
+Month = NewType("Month", int)   # 月类，1-12
+Day   = NewType("Day", int)     # 日类，1-30
+
+@dataclass(frozen=True)
+class Timestamp:                # 时间戳类
+    year: Year
+    month: Month
+    day: Day
 ```
 
 - 权威存储为 **day_index**（自第 1 年 1 月 1 日以来的天数，起点为 0）；
 - 转换：`day_index = (year-1)*360 + (month-1)*30 + (day-1)`；
-- `Timestamp.String()` 输出 `第X年X月X日`；
+- `str(Timestamp)` 输出 `第X年X月X日`；
 - 年龄按天存储，显示为 `X年X月X天`；
-- 提供 `AddDays / Compare / ToDayIndex / FromDayIndex` 方法。
+- 提供 `add_days / compare / to_day_index / from_day_index` 方法。
 
 ### 7.6 模拟器类 `Simulator`
 
-- 文件：`internal/simulator/simulator.go`
+- 文件：`mygame/simulator/simulator.py`
 - **唯一世界推进者与状态写者。**
 
-```go
-type Simulator struct {
-    state   *WorldState
-    cmds    chan Command
-    llmChan chan ai.ActionProposal
-    store   *store.SQLiteStore
-    cfg     *config.Config
-    rng     *rand.Rand
-}
+```python
+import asyncio
+import random
 
-func (s *Simulator) Run(ctx context.Context)
-func (s *Simulator) AdvanceOneStep(ctx context.Context) (*StepResult, error)
-func (s *Simulator) Submit(cmd Command) error
-func (s *Simulator) Snapshot() WorldSnapshot
+class Simulator:
+    def __init__(self, state: WorldState, store: SQLiteStore, cfg: Config):
+        self.state = state
+        self.cmds: asyncio.Queue[Command] = asyncio.Queue()
+        self.llm_proposals: asyncio.Queue[ActionProposal] = asyncio.Queue()
+        self.store = store
+        self.cfg = cfg
+        self.rng = random.Random(cfg.world.seed)
+
+    async def run(self) -> None: ...
+    async def advance_one_step(self) -> StepResult: ...
+    async def submit(self, cmd: Command) -> None: ...
+    def snapshot(self) -> WorldSnapshot: ...
 ```
 
-- `AdvanceOneStep` 是“移动一格”触发的唯一入口；
+- `advance_one_step()` 是“移动一格”触发的唯一入口；
 - 内部先推一个月，再按第 9 节日循环结算，最后月末钩子与单事务落盘；
 - 同时负责：NPC 出生、人物死亡、世界时间、世界事件、世界变化记录；
-- 一次 `AdvanceOneStep` = 一个事务 = 要么整月生效，要么整月回滚。
+- 一次 `advance_one_step()` = 一个事务 = 要么整月生效，要么整月回滚。
 
 ### 7.7 前端类
 
-- 文件：`internal/frontend/*`
+- 文件：`mygame/frontend/`
 - 第一版实现终端文字客户端；
 - 接口预留，后续图形化实现同一接口：
 
-```go
-type Frontend interface {
-    Render(state WorldSnapshot)
-    NextCommand() (Command, error)
-    ShowEvents(events []event.Event)
-}
+```python
+class Frontend(ABC):
+    def render(self, state: WorldSnapshot) -> None: ...
+    async def next_command(self) -> Command: ...
+    def show_events(self, events: list[Event]) -> None: ...
 ```
 
 终端菜单：
@@ -555,18 +587,18 @@ type Frontend interface {
 [G] GM 菜单            [0] 保存并退出
 ```
 
-- **重要交互规则**：入队动作不会推进世界；只有执行“移动”才触发 `AdvanceOneStep` 推进一个月。GM 菜单提供 `advance N months` 用于无移动测试。
+- **重要交互规则**：入队动作不会推进世界；只有执行“移动”才触发 `advance_one_step()` 推进一个月。GM 菜单提供 `advance N months` 用于无移动测试。
 
 ### 7.8 灵气类
 
-- 文件：`internal/world/region.go`（灵气作为 Region 属性）
-- 第一版算法：`实际灵气 = Region.AuraBase × tile_modifier(x,y)`；
+- 文件：`mygame/world/region.py`（灵气作为 Region 属性）
+- 第一版算法：`实际灵气 = region.aura_base × tile_modifier_at(x,y)`；
 - `tile_modifier` 默认全图 1.0，由 `world.yaml` 可选配置，第一版可全用默认；
 - 灵气影响两项：修炼速度、突破成功率；其余影响后续加公式即可。
 
 ### 7.9 修仙等级类
 
-- 文件：`internal/cultivation/realm.go`
+- 文件：`mygame/cultivation/realm.py`
 - 境界表（默认值，全部来自 `realms.yaml`）：
 
 | 顺序 | id | 名称 | 小层 | 基础寿元 |
@@ -576,7 +608,7 @@ type Frontend interface {
 | 2 | jindan | 金丹 | 同上 | 400 年 |
 | 3 | yuanying | 元婴 | 同上 | 800 年 |
 
-- 小层晋升：`ProgressPercent` 满 100 后**自动**进入下一小层；
+- 小层晋升：`progress_percent` 满 100 后**自动**进入下一小层；
 - 大境界晋升：当前大境界“圆满”且小层修为满时，由玩家/NPC 手动发起 `breakthrough` 动作；
 - 突破成功率第一版公式（权重全部配置化）：
 
@@ -598,17 +630,17 @@ P = clamp(base_probability
 
 ### 7.10 灵根类
 
-- 文件：`internal/cultivation/linggen.go`
+- 文件：`mygame/cultivation/linggen.py`
 - 采用**五行占比**模型：
 
-```go
-type LingGen struct {
-    Metal float64 // 金 0-100
-    Wood  float64 // 木
-    Water float64 // 水
-    Fire  float64 // 火
-    Earth float64 // 土
-}
+```python
+@dataclass
+class LingGen:
+    metal: float = 0.0  # 金 0-100
+    wood: float = 0.0   # 木
+    water: float = 0.0  # 水
+    fire: float = 0.0   # 火
+    earth: float = 0.0  # 土
 ```
 
 - 约束：五项之和为 100（容差 0.01）；
@@ -619,81 +651,81 @@ type LingGen struct {
 
 ### 7.11 寿命类与延寿事件字典
 
-- 文件：`internal/simulator/lifespan.go`
+- 文件：`mygame/simulator/lifespan.py`
 - 当前寿命计算：
 
 ```text
 剩余寿元(天) = 当前境界基础寿元(天) + Σ(所有 effective_day_index ≤ 当前日 的延寿事件天数) - 年龄(天)
 ```
 
-- 延寿事件字典即数据库表 `lifespan_events`，同时以 `map[personID][]LifespanEvent` 缓存在内存；
-- 事件在 `OnComplete` 中创建时，生效日 = 当日，立即加入字典并落库；
+- 延寿事件字典即数据库表 `lifespan_events`，同时以 `dict[str, list[LifespanEvent]]` 缓存在内存；
+- 事件在 `on_complete()` 中创建时，生效日 = 当日，立即加入字典并落库；
 - 死亡检查在“延寿生效 → 年龄+1天”之后执行，保证突破成功延寿当天不会误死；
 - 已死亡人物未开始的队列动作清空，并写 `interrupted` 记录。
 
 ### 7.12 事件类
 
-- 文件：`internal/event/*`
+- 文件：`mygame/event/`
 
-```go
-type Event struct {
-    ID         int
-    DayIndex   int
-    Scope      string // person | tile | region | world
-    Type       string // move/cultivate/breakthrough/birth/death/world_event/...
-    TileX      int
-    TileY      int
-    RegionID   string
-    PersonID   string
-    TemplateID string
-    Params     map[string]any
-    ResultText string
-}
+```python
+@dataclass
+class Event:
+    id: int
+    day_index: int
+    scope: str                  # person | tile | region | world
+    event_type: str             # move/cultivate/breakthrough/birth/death/world_event/...
+    tile_x: int | None = None
+    tile_y: int | None = None
+    region_id: str | None = None
+    person_id: str | None = None
+    template_id: str | None = None
+    params: dict = field(default_factory=dict)
+    result_text: str = ""
 ```
 
 - 所有事件统一写 `event_log` 表；
 - 世界事件第一版固定每 6 个月触发一次，模板来自 `events.yaml`；
-- 地块到达事件在 `move.OnComplete` 时触发；
+- 地块到达事件在 `move.on_complete()` 时触发；
 - 以后按 Region 属性、随机时间触发时，只改模板与调度器，不改事件结构。
 
 ### 7.13 NPC AI 类
 
-- 文件：`internal/ai/ai.go`、`rule.go`、`llm.go`
+- 文件：`mygame/ai/base.py`、`rule.py`、`llm.py`
 
-```go
-type Controller interface {
-    Decide(ctx context.Context, snap WorldSnapshot, p person.Person) ([]ActionProposal, error)
-}
+```python
+class Controller(ABC):
+    @abstractmethod
+    def decide(self, snap: WorldSnapshot, person: Person) -> list[ActionProposal]: ...
 ```
 
 **规则类 AI（第一版实际启用）：**
-- 每月 `AdvanceOneStep` 开始时，为每个无当前动作的存活 NPC 决策一次；
+- 每月 `advance_one_step()` 开始时，为每个无当前动作的存活 NPC 决策一次；
 - 按性格五维从 `ai.yaml` 读取动作权重并加权随机；
 - 达到突破条件则尝试突破；
 - 所在 Region 灵气低于阈值时优先移动到相邻高灵气 Region；
-- 决策结果同样通过 `CanExecute` 校验。
+- 决策结果同样通过 `can_execute()` 校验。
 
 **LLM 类 AI（第一版仅接口与配置，默认关闭）：**
-- 配置 DeepSeek 接口（见第 12.5 节）；
+- 配置 DeepSeek 接口（见第 11.4 节）；
 - 两类返回：
   1. **动作链**：一次返回多条有序动作提案；
   2. **突发状况响应**：世界/NPC 发起事件时生成应激动作提案；
-- LLM 返回的 JSON 必须经过 `CanExecute` 校验，非法动作丢弃并记录；
-- 调用在独立 goroutine 中执行，超时或失败自动回退规则 AI；
+- LLM 返回的 JSON 必须经过 `can_execute()` 校验，非法动作丢弃并记录；
+- 调用在 asyncio 线程池中执行，超时或失败自动回退规则 AI；
 - 每个 NPC 每月 LLM 调用次数有限制（`llm.yaml`）。
 
 ### 7.14 角色性格类
 
-- 文件：`internal/personality/personality.go`
+- 文件：`mygame/personality/personality.py`
 
-```go
-type Personality struct {
-    Caution     float64 // 谨慎 0-100
-    Benevolence float64 // 仁善
-    Solitude    float64 // 孤僻
-    Greed       float64 // 贪婪
-    Tenacity    float64 // 坚韧
-}
+```python
+@dataclass
+class Personality:
+    caution: float = 50.0      # 谨慎 0-100
+    benevolence: float = 50.0  # 仁善
+    solitude: float = 50.0     # 孤僻
+    greed: float = 50.0        # 贪婪
+    tenacity: float = 50.0     # 坚韧
 ```
 
 - 影响 NPC 动作选择权重与事件选项；
@@ -703,7 +735,7 @@ type Personality struct {
 
 ### 7.15 ID 类
 
-- 文件：`internal/idgen/idgen.go`
+- 文件：`mygame/idgen.py`
 - 格式：`前缀 + 4 位序号`，例如 `P0001`、`N0001`、`A0001`、`T0001`、`I0001`；
 - 前缀含义：P=玩家，N=NPC，A=动物，T=植物，I=物品实例；
 - 序号持久化在 `id_counters` 表，进程重启后继续递增；
@@ -711,18 +743,19 @@ type Personality struct {
 
 ### 7.16 动物类
 
-- 文件：`internal/ecology/animal.go`
+- 文件：`mygame/ecology/animal.py`
 
-```go
-type Animal struct {
-    ID           string
-    SpeciesID    string
-    PosX, PosY   int
-    Alive        bool
-    AgeDays      int
-    RespawnDay   int // 死亡后计划重生日
-    Attrs        map[string]any
-}
+```python
+@dataclass
+class Animal:
+    id: str
+    species_id: str
+    pos_x: int
+    pos_y: int
+    alive: bool = True
+    age_days: int = 0
+    respawn_day: int | None = None
+    attrs: dict = field(default_factory=dict)
 ```
 
 - 第一版行为：每天随机向相邻可进入格移动 1 格；
@@ -732,54 +765,55 @@ type Animal struct {
 
 ### 7.17 Item 类
 
-- 文件：`internal/item/item.go`
+- 文件：`mygame/item/item.py`
 
-```go
-type Template struct { // 配置定义
-    ID       string
-    Name     string
-    Category string
-    Stackable bool
-    Effects  map[string]any
-    Sprite   string // 预留图片键
-}
+```python
+@dataclass(frozen=True)
+class ItemTemplate:           # 配置定义
+    id: str
+    name: str
+    category: str
+    stackable: bool = True
+    effects: dict = field(default_factory=dict)
+    sprite: str = ""          # 预留图片键
 
-type Instance struct { // 存档只存实例
-    ID         string
-    TemplateID string
-    OwnerID    string
-    Quantity   int
-    Attrs      map[string]any // 随机词条/动态属性，JSON 存储
-}
+@dataclass
+class ItemInstance:           # 存档只存实例
+    id: str
+    template_id: str
+    owner_id: str | None
+    quantity: int = 1
+    attrs: dict = field(default_factory=dict)  # 随机词条/动态属性，JSON 存储
 ```
 
 - 普通素材堆叠；带随机词条的装备不堆叠；
 - 第一版物品用途：药材可服用（提高突破/恢复伤势），狩猎产物只作素材；
-- 后续新增词条只改 `Attrs` 与配置，不改表结构。
+- 后续新增词条只改 `attrs` 与配置，不改表结构。
 
 ### 7.18 灵石类
 
-- 文件：`internal/item/spiritstone.go`
+- 文件：`mygame/item/spiritstone.py`
 - 独立货币，**不放入 Item**；
-- `SpiritStones{Amount int}`，恒 ≥ 0；
+- `SpiritStones(amount: int)`，恒 ≥ 0；
 - 第一版获取：狩猎、采集按概率掉落；
 - 消费入口（坊市/炼丹）后续版本补充。
 
 ### 7.19 植物类
 
-- 文件：`internal/ecology/plant.go`
+- 文件：`mygame/ecology/plant.py`
 
-```go
-type Plant struct {
-    ID          string
-    SpeciesID   string
-    PosX, PosY  int
-    Stage       string // seedling | mature | withered
-    StageDays   int    // 进入当前阶段已过天数
-    Alive       bool
-    RespawnDay  int
-    Attrs       map[string]any
-}
+```python
+@dataclass
+class Plant:
+    id: str
+    species_id: str
+    pos_x: int
+    pos_y: int
+    stage: str = "seedling"   # seedling | mature | withered
+    stage_days: int = 0       # 进入当前阶段已过天数
+    alive: bool = True
+    respawn_day: int | None = None
+    attrs: dict = field(default_factory=dict)
 ```
 
 - 阶段：幼苗 → 成熟 → 枯萎；每天推进生长；
@@ -814,7 +848,7 @@ type Plant struct {
 
 ### 9.1 一次月结算 = 30 天日循环 + 月末钩子
 
-`AdvanceOneStep()` 伪代码：
+`advance_one_step()` 伪代码：
 
 ```text
 begin transaction
@@ -824,8 +858,8 @@ day_index += 30
 
 // 1. 本月 NPC 决策（规则 AI / LLM 提案校验后入队）
 for each alive NPC without running action:
-    proposals = ai.Decide(...)
-    validate CanExecute
+    proposals = ai.decide(...)
+    validate can_execute()
     enqueue
 
 // 2. 30 天日循环
@@ -837,8 +871,8 @@ for day = 1 .. 30:
         if has running action:
             action.elapsed_days += 1
             if action.elapsed_days >= action.total_days:
-                validate CanExecute again
-                action.OnComplete(ctx, person)   // 效果、延寿事件、日志
+                validate can_execute() again
+                action.on_complete(ctx, person)   // 效果、延寿事件、日志
                 mark done; write action_history
                 dequeue
         // 队列下一个动作从“下一日”开始
@@ -876,7 +910,7 @@ if month_number == 12:
 update world_state
 write all changed entities
 commit transaction
-return StepResult{logs, snapshot}
+return StepResult(logs=logs, snapshot=snapshot)
 ```
 
 ### 9.2 同一天内的顺序（定死）
@@ -909,7 +943,7 @@ return StepResult{logs, snapshot}
 
 ### 9.5 事务与回滚
 
-- 一次 `AdvanceOneStep` 对应一个 SQLite 写事务；
+- 一次 `advance_one_step()` 对应一个 SQLite 写事务：结算开始执行 `BEGIN IMMEDIATE`，成功 `COMMIT`，失败 `ROLLBACK` 并恢复内存快照；
 - 结算过程中任何错误：数据库回滚，内存状态恢复到本次结算前快照，返回错误给调用方；
 - 成功提交后更新 `world_state.checkpoint_day_index`；
 - 崩溃场景：SQLite 自动回滚未提交事务，上次已提交月份为有效存档。
@@ -920,8 +954,8 @@ return StepResult{logs, snapshot}
 
 ### 10.1 加载与校验
 
-- 所有 YAML 通过 `internal/config/embed.go` 的 `embed.FS` 打包进二进制；
-- `-config` 参数可指定外部目录覆盖内嵌配置（预留）；
+- 所有 YAML 位于 `configs/` 目录，启动时由 `mygame/config/loader.py` 加载并绑定到 dataclass 模型；
+- `--config` 参数可指定其他配置目录（默认 `./configs`）；
 - 启动时执行：
   1. YAML 解析；
   2. 字段类型与取值范围校验；
@@ -1156,14 +1190,14 @@ fallback: rule                 # 失败回退规则 AI
 
 ### 11.1 IO 文件
 
-- 文件：`internal/io/textfile.go`
+- 文件：`mygame/io_utils/textfile.py`
 - 职责边界：**只负责读取 UTF-8 文本文件**，不负责存档读写（存档在 `store` 包）；
 - 功能：
-  - 读入并去掉 BOM；
+  - 读入并去掉 BOM（`utf-8-sig`）；
   - 每行去空白，忽略空行与 `#` 注释行；
   - 去重；
   - 非 UTF-8 或空文件报错；
-  - 返回 `[]string`。
+  - 返回 `list[str]`。
 
 ### 11.2 名称文件
 
@@ -1184,7 +1218,7 @@ fallback: rule                 # 失败回退规则 AI
 
 ### 11.4 LLM 文件
 
-- 文件：`internal/llmclient/deepseek.go`
+- 文件：`mygame/llmclient/deepseek.py`
 - 三个提示词模板：
   1. `system_prompt.txt`：世界规则、NPC 人设、输出 JSON 格式；
   2. `action_chain_prompt.txt`：生成动作链；
@@ -1196,8 +1230,9 @@ fallback: rule                 # 失败回退规则 AI
 {"actions":[{"type":"cultivate","params":{},"reason":"灵气充足，闭关修炼"}]}
 ```
 
-- 返回动作必须全部通过 `CanExecute`；非法动作丢弃并记 `llm_audit_log`；
-- 第一版 `llm.enabled=false`，实现接口与 Mock，不实际联网。
+- 返回动作必须全部通过 `can_execute()`；非法动作丢弃并记 `llm_audit_log`；
+- 第一版 `llm.enabled=false`，实现接口与 Mock，不实际联网；
+- 真实调用时使用 `asyncio.to_thread` 在线程池执行 `urllib.request`，避免阻塞事件循环。
 
 ---
 
@@ -1205,14 +1240,16 @@ fallback: rule                 # 失败回退规则 AI
 
 ### 12.1 基础设置
 
-- 文件：`data/save.db`（路径可由 `-db` 指定）；
-- 连接即执行：
+- 文件：`data/save.db`（路径可由 `--db` 指定）；
+- 连接代码（Python 标准库 `sqlite3`）：
 
-```sql
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = FULL;
-PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
+```python
+import sqlite3
+conn = sqlite3.connect("data/save.db", isolation_level=None)  # 手动管理事务
+conn.execute("PRAGMA journal_mode = WAL;")
+conn.execute("PRAGMA synchronous = FULL;")
+conn.execute("PRAGMA foreign_keys = ON;")
+conn.execute("PRAGMA busy_timeout = 5000;")
 ```
 
 - 动态属性一律存 JSON 文本列，应用层负责序列化/反序列化；
@@ -1456,7 +1493,7 @@ CREATE TABLE IF NOT EXISTS llm_audit_log (
 用户明确要求“需要更改数据的权限”。第一版提供：
 
 - 终端 GM 菜单（默认隐藏，按 `G` 进入，要求本地管理口令或开发模式）；
-- HTTP GM 接口在 `-http` 模式开放（v0.5 实施），需要请求头 `X-Admin-Token`。
+- HTTP GM 接口在 `--http` 模式开放（v0.5 实施），需要请求头 `X-Admin-Token`。
 
 ### 13.2 GM 命令清单
 
@@ -1489,8 +1526,8 @@ CREATE TABLE IF NOT EXISTS llm_audit_log (
 
 ## 14. 错误处理、日志与可观测性
 
-- 所有错误用 Go `error` 包装，携带上下文（如 `config realms.yaml: unknown technique id: xxx`）；
-- 模拟器结算错误：事务回滚 + `slog.Error` + 返回调用方，进程不崩溃；
+- 所有错误用 Python 异常链携带上下文（`raise ConfigError(...) from err`，如 `config realms.yaml: unknown technique id: xxx`）；
+- 模拟器结算错误：事务回滚 + `logging.error()` + 返回调用方，进程不崩溃；
 - 配置错误：启动即失败，打印具体文件与字段；
 - 数据库错误：停止本次结算，必要时进入只读保护模式；
 - 运行日志输出 stdout，可选写 `data/logs/game.log`；
@@ -1505,7 +1542,7 @@ CREATE TABLE IF NOT EXISTS llm_audit_log (
 | 模块 | 用例 |
 |---|---|
 | gametime | 年月日与 day_index 互转、跨年跨月、加减天数 |
-| world/shape | rect/circle/polygon 的 Contains 与边界 |
+| world/shape | rect/circle/polygon 的 `contains()` 与边界 |
 | world/generation | 每格恰好一个 Region、无覆盖空洞、配置错误报错 |
 | idgen | 重启后序号连续、前缀正确 |
 | namegen | 随机姓名格式、空表报错 |
@@ -1534,8 +1571,12 @@ CREATE TABLE IF NOT EXISTS llm_audit_log (
 
 ```bash
 cd /home/wyh/project/MyGame
-go test ./...
-go run ./cmd/game
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+pip install -r requirements-dev.txt   # 运行测试需要
+python -m pytest tests/ -q
+python -m mygame
 # 终端内依次验证：查看状态 → 移动 → 世界+1月 → 入队修炼 → 再移动 → 修为增加
 ```
 
@@ -1549,15 +1590,15 @@ go run ./cmd/game
 
 | 任务 | 交付物 | 验收标准 |
 |---|---|---|
-| 初始化 Go 项目 | `go.mod`、目录骨架 | `go build ./...` 通过 |
+| 初始化 Python 项目 | `requirements.txt`、`pyproject.toml`、`mygame/` 包目录 | `python -m mygame --help` 通过 |
 | gametime 包 | Year/Month/Day/Timestamp/Calendar | 单测通过 |
 | world 包 | Tile/Region/Shape/Map/generation | YAML 生成 64×64，无空洞 |
-| config 包 | 全部 YAML 结构体 + loader + validate | 坏配置启动即失败 |
+| config 包 | 全部 YAML dataclass 模型 + loader + validate | 坏配置启动即失败 |
 | io + namegen | txt 读取、随机姓名 | 中英文姓名正常 |
 | idgen | 五种 ID 生成 | 重启连续 |
 | person 基础 | 人物字段、出生、历史 5 条 | 玩家初始创建成功 |
 | action 接口 | Action/Queue/registry | 新动作可注册 |
-| simulator | AdvanceOneStep 月/日循环、死亡最后、单事务 | 集成用例 1-6、11 通过 |
+| simulator | `advance_one_step()` 月/日循环、死亡最后、单事务 | 集成用例 1-6、11 通过 |
 | lifespan | 延寿字典与死亡判定 | 用例 5、6 通过 |
 | store | 迁移、仓储、备份 | 重启存档一致 |
 | frontend | 终端菜单 + 10×10 ASCII 地图 | 可交互移动 |
@@ -1592,7 +1633,7 @@ go run ./cmd/game
 | 规则 AI | 每月决策、性格权重、突破/移动策略 | NPC 可自主修炼突破 |
 | 人口系统 | 年末出生、100 上限、死亡移除 | 人口曲线合理 |
 | DeepSeek 客户端 | `llm.yaml` + 提示词 + 异步调用 | `enabled=false` 时零网络请求 |
-| LLM 动作链 | JSON 解析 + CanExecute 校验 + 回退 | 非法动作被丢弃 |
+| LLM 动作链 | JSON 解析 + `can_execute()` 校验 + 回退 | 非法动作被丢弃 |
 | 突发状况 | 世界事件触发 LLM 提案 | 校验通过才执行 |
 
 ### v0.5 GM、HTTP 与收尾
@@ -1600,17 +1641,17 @@ go run ./cmd/game
 | 任务 | 交付物 | 验收标准 |
 |---|---|---|
 | GM 终端菜单 | 第 13.2 节全部命令 | 修改有权限、有日志 |
-| HTTP API | `-http` 模式 + `/api/state`、`/api/command` | curl 可读状态、发指令 |
+| HTTP API | `--http` 模式 + `/api/state`、`/api/command` | curl 可读状态、发指令 |
 | HTTP GM | `X-Admin-Token` + 管理接口 | 无 token 拒绝 |
 | 事件查询 | `list_events` 终端/HTTP | 可按 scope 过滤 |
 | 文档 | README、运行说明、配置说明 | 新手可按文档跑通 |
-| 全量测试 | 15 节用例 | `go test ./...` 全绿 |
+| 全量测试 | 15 节用例 | `python -m pytest tests/ -q` 全绿 |
 
 ---
 
 ## 17. 验收标准（本版完成定义）
 
-- [ ] `go run ./cmd/game` 在 VSCode 中可直接启动；
+- [ ] `python -m mygame` 在 VSCode 中可直接启动；
 - [ ] 玩家移动一格，世界时间恰好推进一个月，事件按第 9 节顺序结算；
 - [ ] 移动、突破、娱乐、修炼、狩猎、采集六类实际动作 + 情绪动作全部注册且可执行判定正确；
 - [ ] 动作进度未到 100% 不产生效果；
@@ -1623,7 +1664,7 @@ go run ./cmd/game
 - [ ] NPC 规则 AI 每月决策，人口不超上限；
 - [ ] DeepSeek 配置默认关闭，接口可异步调用并校验动作；
 - [ ] GM 修改有权限控制并写事件日志；
-- [ ] `go test ./...` 全部通过。
+- [ ] `python -m pytest tests/ -q` 全部通过。
 
 ---
 
@@ -1632,7 +1673,7 @@ go run ./cmd/game
 | 未来功能 | 预留方式 |
 |---|---|
 | 动画/小程序/2D | 前端接口 + `sprite` 字段 + HTTP API |
-| 多玩家/PVP | ID 体系、Command 通道天然支持多请求源 |
+| 多玩家/PVP | ID 体系、`asyncio.Queue` 命令入口天然支持多请求源 |
 | 登录 | `persons.kind=player` 外接账号表即可 |
 | 离线收益 | `world_state` 加 `last_real_seen_at`，按 `time_scale` 补算 |
 | ECS 化 | 如 Person 属性爆炸，把灵根/寿命/背包拆为组件，保持领域方法不变 |
@@ -1753,20 +1794,24 @@ go run ./cmd/game
 ```bash
 cd /home/wyh/project/MyGame
 
-# 初始化模块（首次）
-go mod init mygame
-go get modernc.org/sqlite
-go get gopkg.in/yaml.v3
-go mod tidy
+# 初始化虚拟环境（首次）
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+# 安装依赖
+pip install -r requirements.txt
+pip install -r requirements-dev.txt   # 测试依赖，可选
 
 # 运行
-go run ./cmd/game
+python main.py
+# 或
+python -m mygame
 
 # 测试
-go test ./...
+python -m pytest tests/ -q
 
 # 带 HTTP 模式
-go run ./cmd/game -http :8080
+python main.py --http :8080
 
 # 查看存档
 sqlite3 data/save.db "select * from event_log order by id desc limit 20;"
