@@ -1,0 +1,1773 @@
+# 修仙世界 · 第一版技术规格说明书（SPEC）
+
+- 文档版本：v1.0
+- 对应需求源：`Order.md`
+- 适用范围：当前仓库 `/home/wyh/project/MyGame`
+- 开发原则：**逐个版本迭代开发，每个版本可运行、可测试、可存档；未提及的功能后续以“新增属性/方法/配置”的方式扩展，不推翻现有结构。**
+
+---
+
+## 1. 背景与总体定位
+
+### 1.1 需求来源
+
+本规格根据 `Order.md` 及多轮口头确认整理。`Order.md` 中定义的基础类清单如下：
+
+| 类别 | 类名 |
+|---|---|
+| 基础类 | 人物类、动作类、Tile 类、Region 类、时间类、模拟器类、前端类、灵气类、修仙等级类、灵根类、寿命类、事件类、NPC AI 类、角色性格类、ID 类、动物类、Item 类、灵石类、植物类 |
+| 额外文件 | 名称文件、图片文件、LLM 文件、配置文件、IO 文件 |
+
+### 1.2 游戏形态
+
+- 纯文字、单机、PVE、无登录系统。
+- 以方格地图为基础，玩家在地图上移动。
+- **移动一格 = 世界推进一个月 = 模拟器进行一次完整结算。**
+- 不移动时世界暂停；服务器关闭时世界暂停，重新启动后从存档继续。
+- 第一版优先通过 VSCode 运行和测试，部署问题后续再议。
+
+### 1.3 架构选型：经典结构体 + 接口（方案 A）
+
+本版**不采用 ECS**，采用用户确认的方案 A：
+
+- `Person`、`Action`、`Tile`、`Region`、`Simulator` 等均为普通 Go 结构体；
+- Go 没有继承，使用**组合（embedding）+ 接口**替代继承；
+- 每个动作类实现同一个 `Action` 接口；
+- Region 后续子类（城市、修炼区域、普通区域）通过 `kind` 字段 + 接口扩展，不修改原有 Map/Tile 逻辑；
+- 后续若某个类属性爆炸，再对局部做组件化重构，对外接口保持不变。
+
+---
+
+## 2. 本版已确认的核心决策（不可再随意更改）
+
+| 编号 | 决策 | 说明 |
+|---|---|---|
+| D1 | 组织方式 | 经典结构体 + 接口，不用 ECS |
+| D2 | 世界时间推进 | 玩家移动 1 格 = 世界推进 1 个月 = 模拟器结算 1 次；不移动则世界暂停 |
+| D3 | 月内精度 | 每次月结算内部按 **30 天逐日回放**；年=12月，月=30天 |
+| D4 | 日结算顺序 | 当天动作 → 延寿事件按生效日应用 → 年龄+1天 → 死亡检查（死亡最后判定） |
+| D5 | 动作进度 | 动作按 `已完成天数/总天数` 累计百分比，**未到 100% 不结算效果** |
+| D6 | 动作衔接 | 动作在月中完成时，队列中下一个动作从下一日起继续使用当月剩余天数 |
+| D7 | 死亡规则 | 死亡日之前已完成的动作保留收益；进行中的动作不再推进；未开始的动作清空并记录“因寿终中断” |
+| D8 | 延寿事件 | 采用“延寿事件字典”：每次延寿记录生效时间与增加年数，模拟时按时间顺序应用，死亡检查前汇总已生效事件 |
+| D9 | 地图 | 64×64 方格，由 `world.yaml` 定义 Region 与 Shape，启动时自动生成；预留随机生成开关 |
+| D10 | Tile 职责 | Tile 只记录 x、y、所属 Region；灵气、可进入性、事件等行为全部由 Region 与 Map 统一管理 |
+| D11 | 数据库 | SQLite 单文件存档，WAL + synchronous=FULL + 外键 + 自动备份，关键数据不丢 |
+| D12 | 时间比例 | 第一版为纯回合制：世界时间只随移动推进，不按现实时间推进；`time_scale` 字段预留但默认不启用 |
+| D13 | 存档 | 单存档；关服暂停、重启续档；第一版无离线收益（离线收益以后通过现实时间补算开放） |
+| D14 | 并发 | 所有世界状态只能由模拟器这一条 goroutine 修改；LLM 调用可异步，但只能向模拟器提交“动作提案” |
+| D15 | NPC | 初始 30 个 NPC，人口上限 100；每年出生、每月规则 AI 决策 |
+| D16 | 世界事件 | 第一版固定每 6 个游戏月触发一次；以后按 Region 属性与随机时间扩展 |
+| D17 | 玩家寿终 | 进入“大限将至”状态：不能修炼、不能突破，存档保留，可 GM 回滚；第一版无转世 |
+| D18 | 灵根 | 采用五行占比模型：金/木/水/火/土各 0–100，总和 100；GM 只能在新建人物时设定，运行中不允许修改 |
+| D19 | 灵石 | 独立货币，不放入 Item 类 |
+| D20 | 动物/植物 | 各先提供 20 个默认物种配置，后续按需增删；动物位置持久化，植物分幼苗/成熟/枯萎三阶段 |
+| D21 | 名称生成 | `surnames.txt`（姓氏）+ `male_names.txt`（男名）+ `female_names.txt`（女名）随机组合 |
+| D22 | 图片 | 第一版不加载图片，但所有实体配置预留 `sprite` 字段，供后续图形化使用 |
+| D23 | LLM | 第一版只实现 DeepSeek 配置与接口骨架（`enabled: false`），异步调用、失败回退规则 AI |
+| D24 | 配置热更 | 第一版不做运行中热更；改配置后重启加载，启动时做边界与引用完整性校验 |
+| D25 | 前端 | 第一版为终端文字客户端 + ASCII 地图（周围 10×10） |
+
+---
+
+## 3. 本版明确不做（后续版本再扩展）
+
+以下内容**不进入第一版实现**，但结构上预留扩展点：
+
+- 登录、账号、多玩家、PVP、聊天、宗门、交易；
+- 战斗系统、任务系统；
+- 转世、道侣、宠物、天气、炼丹炼器；
+- 离线收益、真实时间挂机；
+- WebSocket、Redis、PostgreSQL/MySQL、MongoDB；
+- 图片渲染、动画、微信小程序、2D 画面；
+- 配置运行中热更新；
+- 任务系统（第一版只做“地块/区域事件”）；
+- 动物繁衍。
+
+---
+
+## 4. 技术栈
+
+| 项目 | 选择 | 理由 |
+|---|---|---|
+| 语言 | Go 1.22+ | 用户指定；单二进制部署 |
+| 数据库 | SQLite | 单机单存档；`modernc.org/sqlite` 为纯 Go 驱动，VSCode/Windows 下无需 CGO |
+| 配置格式 | YAML | `gopkg.in/yaml.v3` |
+| 文本文件 | UTF-8 TXT | 自写 IO 工具，见第 11 节 |
+| HTTP（预留） | Go 标准库 `net/http` | Go 1.22 的 ServeMux 已支持方法匹配与路径参数，第一版不引入 Web 框架 |
+| 日志 | 标准库 `log/slog` | 结构化日志 |
+| 随机数 | `math/rand/v2` | 世界种子可复现 |
+| 资源打包 | `embed.FS` | 配置、名称表、提示词模板打进二进制 |
+| 测试 | 标准库 `testing` | 单元测试 + 模拟器集成测试 |
+| LLM（预留） | `net/http` + `encoding/json` | 兼容 DeepSeek（OpenAI 格式）接口 |
+
+**第一版依赖清单：**
+
+```
+modernc.org/sqlite
+gopkg.in/yaml.v3
+```
+
+其余全部使用 Go 标准库。后续若需要 WebSocket、MongoDB、Redis 等，再按版本引入，不提前引入。
+
+---
+
+## 5. 总体架构
+
+### 5.1 运行形态
+
+```text
+第一版推荐运行方式（VSCode 内）：
+  cd /home/wyh/project/MyGame
+  go run ./cmd/game
+
+程序启动后：
+  1. 加载内嵌配置并校验；
+  2. 打开 SQLite（不存在则初始化并生成世界）；
+  3. 恢复世界时间、人物、地图实体、动作队列；
+  4. 启动模拟器 goroutine；
+  5. 进入终端文字菜单循环。
+```
+
+程序通过命令行参数切换模式：
+
+| 参数 | 作用 |
+|---|---|
+| `-http :8080` | 额外启动 HTTP API（为 GM 与后续图形前端预留） |
+| `-gm` | 启动后直接进入 GM 菜单 |
+| `-config ./configs` | 使用外部配置目录覆盖内嵌配置（预留） |
+| `-db ./data/save.db` | 指定存档路径 |
+
+### 5.2 进程内数据流
+
+```text
+终端输入 / HTTP 请求 / GM 命令
+        │
+        ▼
+   Command 通道（模拟器唯一入口）
+        │
+        ▼
+┌────────────────────────────────┐
+│   Simulator（唯一写 goroutine）  │
+│  1. 校验动作合法性               │
+│  2. 推进 1 个月（内部 30 天）     │
+│  3. 月末钩子（世界事件/出生）     │
+│  4. 单事务写 SQLite             │
+│  5. 返回结果快照与事件日志        │
+└────────────────────────────────┘
+        │
+        ▼
+   终端渲染 / HTTP JSON 响应
+```
+
+### 5.3 并发规则（“协程化机制”的正确实现）
+
+用户要求“动作可以异步实现，实行协程化机制”，同时要求“所有结算操作都在模拟器中进行”。两者结合后的规则：
+
+1. **世界状态单写者**：模拟器 goroutine 是唯一允许修改 `WorldState` 的 goroutine。
+2. **长动作不靠 goroutine 计时**：动作是状态机 `waiting → running → done/cancelled/interrupted`，进度存在 `ActionQueueEntry` 中，由模拟器在日循环中推进。这样“等待 30 天”不会占用任何常驻计时 goroutine。
+3. **允许异步的部分**：
+   - LLM 请求在独立 goroutine 中执行，超时后返回或放弃；
+   - LLM 只能返回“动作提案”，模拟器通过 `CanExecute` 校验后才入队；
+   - 终端/HTTP 的请求 goroutine 只向模拟器发送 Command，不直接改状态。
+4. **查询并发**：其他 goroutine 通过模拟器提供的 `Snapshot()` 读取不可变快照，不直接读写内部状态。
+5. **关服安全**：`Shutdown` 命令会让模拟器完成当前结算、强制落盘后退出。
+
+```text
+请求 goroutine ──Command──► 模拟器 goroutine ──事务──► SQLite
+LLM goroutine ──ActionProposal──► 模拟器 goroutine（校验后入队）
+查询 goroutine ──SnapshotRequest──► 模拟器 goroutine ──Snapshot──► 查询 goroutine
+```
+
+---
+
+## 6. 项目目录结构
+
+```
+MyGame/
+├── Order.md                         # 需求原始文件
+├── SPEC.md                          # 本文件
+├── go.mod
+├── go.sum
+├── cmd/
+│   └── game/
+│       └── main.go                  # 程序入口：终端 + 可选 HTTP
+├── internal/
+│   ├── app/
+│   │   └── app.go                   # 依赖装配、启动/关闭流程
+│   ├── world/
+│   │   ├── map.go                   # Map：统一管理 Tile/Region/寻路/边界
+│   │   ├── tile.go                  # Tile 类
+│   │   ├── region.go                # Region 类 + kind 分发
+│   │   ├── shape.go                 # Shape 接口 + rect/circle/polygon
+│   │   └── generation.go            # 按 world.yaml 生成地图、校验覆盖
+│   ├── person/
+│   │   ├── person.go                # 人物类（玩家与 NPC 统一）
+│   │   └── history.go               # 最近 5 条动作记录（传记）
+│   ├── action/
+│   │   ├── action.go                # Action 接口、队列条目、进度百分比
+│   │   ├── registry.go              # 动作注册表（新增动作只在此注册）
+│   │   ├── move.go                  # 移动动作
+│   │   ├── cultivate.go             # 修炼动作
+│   │   ├── breakthrough.go          # 突破动作
+│   │   ├── entertain.go             # 娱乐动作
+│   │   ├── hunt.go                  # 狩猎动作
+│   │   ├── gather.go                # 采集动作
+│   │   └── emotion.go               # 情绪动作
+│   ├── gametime/
+│   │   ├── year.go                  # 年类
+│   │   ├── month.go                 # 月类
+│   │   ├── day.go                   # 日类
+│   │   ├── timestamp.go             # 时间戳类：年-月-日
+│   │   └── calendar.go              # day_index 与年/月/日互转
+│   ├── simulator/
+│   │   ├── simulator.go             # 模拟器类：单写者、Command 通道
+│   │   ├── settlement.go            # 月结算 = 30 天日循环 + 月末钩子
+│   │   ├── lifespan.go              # 延寿事件字典应用与死亡判定
+│   │   ├── checkpoint.go            # 存档检查点与事务提交
+│   │   └── command.go               # Command/Result/Snapshot 类型
+│   ├── cultivation/
+│   │   ├── realm.go                 # 修仙等级类
+│   │   ├── linggen.go               # 灵根类（五行占比）
+│   │   ├── technique.go             # 功法（本版读配置）
+│   │   └── formula.go               # 修炼/突破公式（配置驱动）
+│   ├── ecology/
+│   │   ├── animal.go                # 动物类
+│   │   ├── plant.go                 # 植物类
+│   │   └── growth.go                # 生长/重生推进
+│   ├── item/
+│   │   ├── item.go                  # Item 类（模板 + 实例）
+│   │   └── spiritstone.go           # 灵石类（独立货币）
+│   ├── event/
+│   │   ├── event.go                 # 事件类（世界记录）
+│   │   ├── template.go              # 事件模板
+│   │   └── log.go                   # 事件写入 event_log
+│   ├── ai/
+│   │   ├── ai.go                    # NPC AI 接口
+│   │   ├── rule.go                  # 规则类 AI
+│   │   └── llm.go                   # LLM 类 AI（动作链 + 突发状况）
+│   ├── personality/
+│   │   └── personality.go           # 角色性格类（五维）
+│   ├── idgen/
+│   │   └── idgen.go                 # ID 类
+│   ├── config/
+│   │   ├── loader.go                # 配置文件类：YAML 边界导入
+│   │   ├── validate.go              # 边界/引用/数值校验
+│   │   ├── embed.go                 # embed.FS 入口
+│   │   └── types.go                 # 配置结构体定义
+│   ├── namegen/
+│   │   └── namegen.go               # 名称文件加载与随机姓名
+│   ├── io/
+│   │   └── textfile.go              # IO 文件：只读 UTF-8 TXT
+│   ├── llmclient/
+│   │   └── deepseek.go              # DeepSeek 异步调用（预留）
+│   ├── store/
+│   │   ├── sqlite.go                # 连接、PRAGMA、事务
+│   │   ├── migrations.go            # 迁移执行
+│   │   ├── backup.go                # 自动备份
+│   │   ├── repo_world.go            # 世界/时间存取
+│   │   ├── repo_person.go           # 人物/动作队列/历史存取
+│   │   ├── repo_ecology.go          # 动物/植物存取
+│   │   ├── repo_item.go             # 物品/灵石存取
+│   │   └── repo_event.go            # 事件日志存取
+│   ├── frontend/
+│   │   ├── terminal.go              # 前端类：终端文字客户端
+│   │   ├── menu.go                  # 菜单与输入处理
+│   │   └── render.go                # ASCII 地图与状态渲染
+│   └── server/
+│       ├── http.go                  # HTTP API（预留）
+│       └── gm.go                    # GM 管理接口（预留）
+├── configs/
+│   ├── world.yaml                   # 地图、Region、Shape、灵气、出生点
+│   ├── realms.yaml                  # 境界、寿元、突破公式
+│   ├── techniques.yaml              # 5 本功法
+│   ├── spirit_roots.yaml            # 五行灵根
+│   ├── actions.yaml                 # 动作耗时与效果参数
+│   ├── animals.yaml                 # 20 种动物
+│   ├── plants.yaml                  # 20 种植物
+│   ├── items.yaml                   # 物品模板
+│   ├── events.yaml                  # 事件模板
+│   ├── ai.yaml                      # 规则 AI 与性格权重
+│   └── llm.yaml                     # DeepSeek 配置（默认关闭）
+├── assets/
+│   ├── names/
+│   │   ├── surnames.txt
+│   │   ├── male_names.txt
+│   │   └── female_names.txt
+│   ├── prompts/
+│   │   ├── system_prompt.txt
+│   │   ├── action_chain_prompt.txt
+│   │   └── emergent_event_prompt.txt
+│   └── sprites/
+│       └── README.md                # 第一版不加载图片，仅预留 sprite 键目录
+├── data/                            # 运行时数据（gitignore）
+│   ├── save.db                      # SQLite 主存档
+│   ├── backups/                     # 自动备份
+│   └── logs/                        # 运行日志（可选）
+└── tests/
+    ├── unit/                        # 纯逻辑单测
+    └── integration/                 # 模拟器长流程测试
+```
+
+---
+
+## 7. 领域类详细设计（对应 Order.md 的每一个类）
+
+### 7.1 人物类 `Person`
+
+- 文件：`internal/person/person.go`
+- 玩家与 NPC 统一使用 `Person`，通过 `Kind` 区分；玩家额外属性放 `extra_json`，NPC 决策由 `ai.Controller` 负责。
+
+```go
+type Kind string // "player" | "npc"
+
+type Person struct {
+    ID             string          // P0001 / N0001
+    Kind           Kind
+    Name           string
+    Gender         string          // male | female
+    BirthDayIndex  int             // 出生日（day_index）
+    AgeDays        int             // 年龄（天），内部权威值
+    Alive          bool
+    DeathDayIndex  int             // 死亡日；未死亡为 -1
+    PosX, PosY     int
+    RealmID        string          // lianqi / zhuji / jindan / yuanying
+    StageIndex     int             // 0 初期 1 中期 2 后期 3 圆满
+    ProgressPercent float64        // 当前小层修为进度 0-100
+    TechniqueID    string
+    BaseLifespanDays int           // 当前境界基础寿元快照
+    Mood           float64         // 0-100
+    SpiritRoot     cultivation.LingGen
+    Personality    personality.Personality
+    Status         Status          // 轻伤/突破冷却等，序列化为 status_json
+    ActionQueue    *action.Queue
+    History        *History        // 最近 5 条动作记录
+    Stones         item.SpiritStones
+    Items          []*item.Instance
+    Extra          map[string]any // extra_json，后续新属性先放这里
+}
+```
+
+**方法（第一版必须实现）：**
+
+| 方法 | 说明 |
+|---|---|
+| `AgeString()` | 年龄按“X年X月X天”显示 |
+| `GetCultivationProgress()` | 获取修仙进度（境界/小层/百分比） |
+| `IsOldAndDead(currentDay int)` | 是否因寿元耗尽死亡（见寿命类） |
+| `CurrentLifespanDays(currentDay int)` | 基础寿元 + 已生效延寿事件之和 |
+| `GetActionHistory(limit int)` | 获取历史动作，默认最近 5 条 |
+| `CanDo(act)` | 调用动作的 `CanExecute` 做合法性判断 |
+| `QueueAction(act)` | 向动作队列追加动作 |
+| `AddLifespanEvent(...)` | 添加一条延寿事件（写字典） |
+| `ApplyDeath(day, reason)` | 玩家保留存档置死；NPC 移除 |
+| `SetSpiritRoot(...)` | 仅新建人物时允许调用 |
+
+**约束：**
+- `Kind == player` 在系统中只能有一个；
+- NPC 死亡后实体移除，玩家死亡后实体保留（`Alive=false`）。
+
+---
+
+### 7.2 动作类 `Action`
+
+- 文件：`internal/action/action.go`
+- 所有动作实现同一接口；新增动作 = 新文件 + 在 `registry.go` 注册一行，不改旧代码。
+
+```go
+type Kind string // "physical" 实际动作 | "emotion" 情绪动作
+
+type Action interface {
+    Type() string                       // move/cultivate/breakthrough/entertain/hunt/gather/emotion_xxx
+    Kind() Kind
+    DurationDays() int                  // 0 = 即时
+    CanExecute(ctx *SimContext, p *person.Person) error
+    OnStart(ctx *SimContext, p *person.Person) error
+    OnComplete(ctx *SimContext, p *person.Person) error
+    OnInterrupt(ctx *SimContext, p *person.Person, reason string) error
+}
+```
+
+**动作队列条目：**
+
+```go
+type QueueEntry struct {
+    PersonID    string
+    Seq         int
+    ActionType  string
+    Params      map[string]any // 例如移动方向、修炼功法
+    TotalDays   int
+    ElapsedDays int
+    State       string         // waiting | running | done | cancelled | interrupted
+}
+func (e *QueueEntry) ProgressPercent() float64 // 未到 100% 不结算
+```
+
+**第一版七类动作：**
+
+| 动作 | 类型 | 耗时 | 说明 |
+|---|---|---|---|
+| `move` | 实际 | 3 天 | 移动到相邻方格；完成后更新坐标并触发到达事件 |
+| `cultivate` | 实际 | 30 天 | 完成后按公式增加修为；100% 才结算 |
+| `breakthrough` | 实际 | 7 天 | 完成后判定是否晋升大境界 |
+| `entertain` | 实际 | 3 天 | 完成时少量修为 + 恢复心情 |
+| `hunt` | 实际 | 15 天 | 完成后按境界/危险度判定是否获得猎物 |
+| `gather` | 实际 | 5 天 | 完成后判定是否采到当前格成熟植物 |
+| `emotion_*` | 情绪 | 0 天 | 即时动作，只改变心情/性格，不改变世界 |
+
+**动作执行条件**（`CanExecute`）在 Go 代码中直接编写函数，第一版检查项包括：
+- 人物存活、状态正常；
+- 大限将至者不能 `cultivate` / `breakthrough`；
+- 突破需要当前小层为“圆满”且无突破冷却；
+- 移动目标在边界内、可进入、无境界限制；
+- 狩猎/采集要求当前 Region 允许；
+- 同一人物同一时刻只有一个动作在运行，其余排队。
+
+**协程化说明：**
+- 长动作通过 `QueueEntry` 状态机 + 模拟器日循环推进，不使用常驻 goroutine 计时；
+- 效果只在 `ProgressPercent == 100%` 时通过 `OnComplete` 结算；
+- 中断/死亡只调用 `OnInterrupt`，不重复结算。
+
+---
+
+### 7.3 Tile 类
+
+- 文件：`internal/world/tile.go`
+
+```go
+type Tile struct {
+    X        int
+    Y        int
+    RegionID string
+}
+```
+
+- Tile 只记录坐标和所属 Region，不记录地形、灵气等派生数据；
+- 行为合理性（能否进入、能做什么动作）由 `Map.RegionAt(x, y)` 返回的 Region 决定；
+- 后续若要加“地块修饰”（如灵泉眼），通过 `world.yaml` 的 `tile_modifiers` 层或 Region 子类实现，不修改 Tile 结构。
+
+### 7.4 Region 类与 Shape 类
+
+- 文件：`internal/world/region.go`、`internal/world/shape.go`
+
+```go
+type RegionKind string // "normal" | "city" | "cultivation" | "ruin"
+
+type Region struct {
+    ID          string
+    Name        string
+    Kind        RegionKind
+    Shape       Shape
+    AuraBase    float64   // 灵气基础值
+    Danger      int       // 危险度
+    Enterable   bool      // 是否可进入
+    MinRealm    string    // 进入所需最低境界
+    EventPool   []string  // 本区域事件模板 ID
+}
+
+type Shape interface {
+    Contains(x, y int) bool
+    Bounds() (minX, minY, maxX, maxY int)
+}
+```
+
+Shape 实现：
+- `RectShape{x, y, w, h}`：矩形；
+- `CircleShape{cx, cy, r}`：圆形；
+- `PolygonShape{points}`：多边形。
+
+**约束：**
+- 启动时校验地图每个 Tile 都被恰好一个 Region 覆盖；
+- 第一版禁止 Region 重叠；如重叠，配置校验直接失败（后续可加 priority 字段）；
+- Region 后续子类（城市、修炼区）先通过 `Kind` 分支实现，不写 Go 继承。
+
+### 7.5 时间类
+
+- 文件：`internal/gametime/*`
+
+```go
+type Year  int  // 年类
+type Month int  // 月类，1-12
+type Day   int  // 日类，1-30
+
+type Timestamp struct { // 时间戳类
+    Year  Year
+    Month Month
+    Day   Day
+}
+```
+
+- 权威存储为 **day_index**（自第 1 年 1 月 1 日以来的天数，起点为 0）；
+- 转换：`day_index = (year-1)*360 + (month-1)*30 + (day-1)`；
+- `Timestamp.String()` 输出 `第X年X月X日`；
+- 年龄按天存储，显示为 `X年X月X天`；
+- 提供 `AddDays / Compare / ToDayIndex / FromDayIndex` 方法。
+
+### 7.6 模拟器类 `Simulator`
+
+- 文件：`internal/simulator/simulator.go`
+- **唯一世界推进者与状态写者。**
+
+```go
+type Simulator struct {
+    state   *WorldState
+    cmds    chan Command
+    llmChan chan ai.ActionProposal
+    store   *store.SQLiteStore
+    cfg     *config.Config
+    rng     *rand.Rand
+}
+
+func (s *Simulator) Run(ctx context.Context)
+func (s *Simulator) AdvanceOneStep(ctx context.Context) (*StepResult, error)
+func (s *Simulator) Submit(cmd Command) error
+func (s *Simulator) Snapshot() WorldSnapshot
+```
+
+- `AdvanceOneStep` 是“移动一格”触发的唯一入口；
+- 内部先推一个月，再按第 9 节日循环结算，最后月末钩子与单事务落盘；
+- 同时负责：NPC 出生、人物死亡、世界时间、世界事件、世界变化记录；
+- 一次 `AdvanceOneStep` = 一个事务 = 要么整月生效，要么整月回滚。
+
+### 7.7 前端类
+
+- 文件：`internal/frontend/*`
+- 第一版实现终端文字客户端；
+- 接口预留，后续图形化实现同一接口：
+
+```go
+type Frontend interface {
+    Render(state WorldSnapshot)
+    NextCommand() (Command, error)
+    ShowEvents(events []event.Event)
+}
+```
+
+终端菜单：
+
+```text
+【青云修士】炼气·初期 | 修为 12.3% | 寿元 18年3月 | 心情 80
+当前位置：青云山脚(12,8)  灵气：10
+
+[1] 移动（上下左右）   [2] 突破        [3] 娱乐
+[4] 开始修炼           [5] 狩猎        [6] 采集
+[7] 查看状态           [8] 查看传记    [9] 查看地图
+[G] GM 菜单            [0] 保存并退出
+```
+
+- **重要交互规则**：入队动作不会推进世界；只有执行“移动”才触发 `AdvanceOneStep` 推进一个月。GM 菜单提供 `advance N months` 用于无移动测试。
+
+### 7.8 灵气类
+
+- 文件：`internal/world/region.go`（灵气作为 Region 属性）
+- 第一版算法：`实际灵气 = Region.AuraBase × tile_modifier(x,y)`；
+- `tile_modifier` 默认全图 1.0，由 `world.yaml` 可选配置，第一版可全用默认；
+- 灵气影响两项：修炼速度、突破成功率；其余影响后续加公式即可。
+
+### 7.9 修仙等级类
+
+- 文件：`internal/cultivation/realm.go`
+- 境界表（默认值，全部来自 `realms.yaml`）：
+
+| 顺序 | id | 名称 | 小层 | 基础寿元 |
+|---|---|---|---|---|
+| 0 | lianqi | 炼气 | 初期/中期/后期/圆满 | 100 年 |
+| 1 | zhuji | 筑基 | 同上 | 200 年 |
+| 2 | jindan | 金丹 | 同上 | 400 年 |
+| 3 | yuanying | 元婴 | 同上 | 800 年 |
+
+- 小层晋升：`ProgressPercent` 满 100 后**自动**进入下一小层；
+- 大境界晋升：当前大境界“圆满”且小层修为满时，由玩家/NPC 手动发起 `breakthrough` 动作；
+- 突破成功率第一版公式（权重全部配置化）：
+
+```text
+P = clamp(base_probability
+    × (1 + w_linggen × 灵根契合度)
+    × (1 + w_technique × 功法加成)
+    × (1 + w_lifespan × 剩余寿元比例)
+    × (1 + w_aura × 灵气系数)
+    × (1 + w_mood × 心情系数)
+    × (1 + w_item × 物品加成), 0, 1)
+```
+
+- 突破失败惩罚（默认值，可配）：
+  - 当前小层修为损失 10%；
+  - 轻伤 30 天（期间修炼速度减半）；
+  - 突破冷却 5 天；
+  - 大境界突破失败额外损失 1 年寿元（写入延寿事件字典，值为负）。
+
+### 7.10 灵根类
+
+- 文件：`internal/cultivation/linggen.go`
+- 采用**五行占比**模型：
+
+```go
+type LingGen struct {
+    Metal float64 // 金 0-100
+    Wood  float64 // 木
+    Water float64 // 水
+    Fire  float64 // 火
+    Earth float64 // 土
+}
+```
+
+- 约束：五项之和为 100（容差 0.01）；
+- 新建人物时按 `spirit_roots.yaml` 的分布随机生成；GM 可在创建时指定；
+- 运行中不允许修改灵根；
+- 修炼时按“主属性契合度”计算加成，公式在配置中；
+- 存档格式为 JSON：`{"metal":50,"wood":20,"water":10,"fire":15,"earth":5}`。
+
+### 7.11 寿命类与延寿事件字典
+
+- 文件：`internal/simulator/lifespan.go`
+- 当前寿命计算：
+
+```text
+剩余寿元(天) = 当前境界基础寿元(天) + Σ(所有 effective_day_index ≤ 当前日 的延寿事件天数) - 年龄(天)
+```
+
+- 延寿事件字典即数据库表 `lifespan_events`，同时以 `map[personID][]LifespanEvent` 缓存在内存；
+- 事件在 `OnComplete` 中创建时，生效日 = 当日，立即加入字典并落库；
+- 死亡检查在“延寿生效 → 年龄+1天”之后执行，保证突破成功延寿当天不会误死；
+- 已死亡人物未开始的队列动作清空，并写 `interrupted` 记录。
+
+### 7.12 事件类
+
+- 文件：`internal/event/*`
+
+```go
+type Event struct {
+    ID         int
+    DayIndex   int
+    Scope      string // person | tile | region | world
+    Type       string // move/cultivate/breakthrough/birth/death/world_event/...
+    TileX      int
+    TileY      int
+    RegionID   string
+    PersonID   string
+    TemplateID string
+    Params     map[string]any
+    ResultText string
+}
+```
+
+- 所有事件统一写 `event_log` 表；
+- 世界事件第一版固定每 6 个月触发一次，模板来自 `events.yaml`；
+- 地块到达事件在 `move.OnComplete` 时触发；
+- 以后按 Region 属性、随机时间触发时，只改模板与调度器，不改事件结构。
+
+### 7.13 NPC AI 类
+
+- 文件：`internal/ai/ai.go`、`rule.go`、`llm.go`
+
+```go
+type Controller interface {
+    Decide(ctx context.Context, snap WorldSnapshot, p person.Person) ([]ActionProposal, error)
+}
+```
+
+**规则类 AI（第一版实际启用）：**
+- 每月 `AdvanceOneStep` 开始时，为每个无当前动作的存活 NPC 决策一次；
+- 按性格五维从 `ai.yaml` 读取动作权重并加权随机；
+- 达到突破条件则尝试突破；
+- 所在 Region 灵气低于阈值时优先移动到相邻高灵气 Region；
+- 决策结果同样通过 `CanExecute` 校验。
+
+**LLM 类 AI（第一版仅接口与配置，默认关闭）：**
+- 配置 DeepSeek 接口（见第 12.5 节）；
+- 两类返回：
+  1. **动作链**：一次返回多条有序动作提案；
+  2. **突发状况响应**：世界/NPC 发起事件时生成应激动作提案；
+- LLM 返回的 JSON 必须经过 `CanExecute` 校验，非法动作丢弃并记录；
+- 调用在独立 goroutine 中执行，超时或失败自动回退规则 AI；
+- 每个 NPC 每月 LLM 调用次数有限制（`llm.yaml`）。
+
+### 7.14 角色性格类
+
+- 文件：`internal/personality/personality.go`
+
+```go
+type Personality struct {
+    Caution     float64 // 谨慎 0-100
+    Benevolence float64 // 仁善
+    Solitude    float64 // 孤僻
+    Greed       float64 // 贪婪
+    Tenacity    float64 // 坚韧
+}
+```
+
+- 影响 NPC 动作选择权重与事件选项；
+- 对玩家只作展示；
+- 重大事件可按 `events.yaml` 中的 `personality_effects` 修改五维；
+- 所有变化必须由模拟器结算，禁止外部直接赋值。
+
+### 7.15 ID 类
+
+- 文件：`internal/idgen/idgen.go`
+- 格式：`前缀 + 4 位序号`，例如 `P0001`、`N0001`、`A0001`、`T0001`、`I0001`；
+- 前缀含义：P=玩家，N=NPC，A=动物，T=植物，I=物品实例；
+- 序号持久化在 `id_counters` 表，进程重启后继续递增；
+- 生成逻辑简单、易扩展；以后需要雪花算法时只替换本类。
+
+### 7.16 动物类
+
+- 文件：`internal/ecology/animal.go`
+
+```go
+type Animal struct {
+    ID           string
+    SpeciesID    string
+    PosX, PosY   int
+    Alive        bool
+    AgeDays      int
+    RespawnDay   int // 死亡后计划重生日
+    Attrs        map[string]any
+}
+```
+
+- 第一版行为：每天随机向相邻可进入格移动 1 格；
+- 狩猎成功率 = 查 `animals.yaml` 的 `hunt_difficulty` 与人物境界对照表；
+- 动物死亡后按配置时间重生；位置持久化；
+- 繁衍后续版本再加。
+
+### 7.17 Item 类
+
+- 文件：`internal/item/item.go`
+
+```go
+type Template struct { // 配置定义
+    ID       string
+    Name     string
+    Category string
+    Stackable bool
+    Effects  map[string]any
+    Sprite   string // 预留图片键
+}
+
+type Instance struct { // 存档只存实例
+    ID         string
+    TemplateID string
+    OwnerID    string
+    Quantity   int
+    Attrs      map[string]any // 随机词条/动态属性，JSON 存储
+}
+```
+
+- 普通素材堆叠；带随机词条的装备不堆叠；
+- 第一版物品用途：药材可服用（提高突破/恢复伤势），狩猎产物只作素材；
+- 后续新增词条只改 `Attrs` 与配置，不改表结构。
+
+### 7.18 灵石类
+
+- 文件：`internal/item/spiritstone.go`
+- 独立货币，**不放入 Item**；
+- `SpiritStones{Amount int}`，恒 ≥ 0；
+- 第一版获取：狩猎、采集按概率掉落；
+- 消费入口（坊市/炼丹）后续版本补充。
+
+### 7.19 植物类
+
+- 文件：`internal/ecology/plant.go`
+
+```go
+type Plant struct {
+    ID          string
+    SpeciesID   string
+    PosX, PosY  int
+    Stage       string // seedling | mature | withered
+    StageDays   int    // 进入当前阶段已过天数
+    Alive       bool
+    RespawnDay  int
+    Attrs       map[string]any
+}
+```
+
+- 阶段：幼苗 → 成熟 → 枯萎；每天推进生长；
+- 只能采集“成熟”植株；采集后按配置天数重生；
+- 按 Region 类型随机分布，位置持久化。
+
+---
+
+## 8. 时间系统规范
+
+### 8.1 历法
+
+- 1 年 = 12 个月；
+- 1 月 = 30 天；
+- 1 年 = 360 天；
+- 纪元从 `第1年1月1日` 开始，对应 `day_index = 0`；
+- 第一版不使用现实时间推进世界。
+
+### 8.2 世界推进规则
+
+| 行为 | 世界时间 |
+|---|---|
+| 玩家移动 1 格 | +1 个月（内部 30 天逐日回放） |
+| 入队修炼/突破/娱乐等动作 | 不推进，等待下次移动结算 |
+| 服务器关闭 | 世界暂停，存档保留 |
+| 服务器重启 | 从存档的 `day_index` 继续 |
+| GM `advance N months` | +N 个月，用于测试 |
+
+---
+
+## 9. 模拟器结算规范（本文件最重要的算法）
+
+### 9.1 一次月结算 = 30 天日循环 + 月末钩子
+
+`AdvanceOneStep()` 伪代码：
+
+```text
+begin transaction
+
+// 0. 推进世界时间
+day_index += 30
+
+// 1. 本月 NPC 决策（规则 AI / LLM 提案校验后入队）
+for each alive NPC without running action:
+    proposals = ai.Decide(...)
+    validate CanExecute
+    enqueue
+
+// 2. 30 天日循环
+for day = 1 .. 30:
+    current_day = 本月起始日 + day
+
+    // 2.1 人物动作推进（先动作，后其他）
+    for each alive person:
+        if has running action:
+            action.elapsed_days += 1
+            if action.elapsed_days >= action.total_days:
+                validate CanExecute again
+                action.OnComplete(ctx, person)   // 效果、延寿事件、日志
+                mark done; write action_history
+                dequeue
+        // 队列下一个动作从“下一日”开始
+        // （0 天情绪动作：当日完成效果，下一动作同样从下一日开始）
+
+    // 2.2 动物行为
+    for each alive animal:
+        move 1 格（每天）
+
+    // 2.3 植物生长
+    for each alive plant:
+        growth += 1 day; 按阶段推进/枯萎
+
+    // 2.4 老化与死亡（先加年龄，后判死；死亡最后）
+    for each alive person:
+        person.age_days += 1
+        lifespan_now = base_lifespan_days + sum(延寿事件 effective_day <= current_day)
+        if person.age_days >= lifespan_now:
+            mark death at current_day
+            clear action queue (not-started → interrupted)
+            if player: keep entity, alive=false, status=大限将至
+            if npc: remove entity
+            write death event
+
+// 3. 月末钩子
+if month_number % 6 == 0:
+    trigger world event (模板来自 events.yaml)
+    write world event to event_log
+
+if month_number == 12:
+    NPC 出生（概率、人口上限 100）
+    write birth events
+
+// 4. 检查点
+update world_state
+write all changed entities
+commit transaction
+return StepResult{logs, snapshot}
+```
+
+### 9.2 同一天内的顺序（定死）
+
+```text
+当天动作完成/效果 → 延寿事件按生效日应用 → 年龄 +1 天 → 死亡检查
+```
+
+死亡检查永远是当天最后一步，保证：
+- 突破成功当天延寿不会误死；
+- 已经死亡的人不会继续执行当天之后任何动作；
+- 死亡日之前已完成动作的收益全部保留。
+
+### 9.3 月中死亡与“做了一半的行为”
+
+| 场景 | 规则 |
+|---|---|
+| 死亡日前已完成的动作 | 效果保留，记录正常 `done` |
+| 死亡时正在进行的动作 | 推进到死亡当天为止，不再推进，不结算效果，记录 `interrupted` |
+| 死亡时尚未开始的动作 | 从队列清空，记录 `interrupted`，原因“寿终中断” |
+| 死亡后队列新增 | 禁止 |
+
+### 9.4 延寿事件字典
+
+- 结构：`(person_id, effective_day_index, days_added, reason, source_id)`；
+- `days_added` 可为负（突破失败减寿）；
+- 内存缓存 + `lifespan_events` 表双写；
+- 每次死亡检查前实时求和，不缓存“剩余寿元”的陈旧值；
+- GM 加减寿元同样写该字典，保留审计。
+
+### 9.5 事务与回滚
+
+- 一次 `AdvanceOneStep` 对应一个 SQLite 写事务；
+- 结算过程中任何错误：数据库回滚，内存状态恢复到本次结算前快照，返回错误给调用方；
+- 成功提交后更新 `world_state.checkpoint_day_index`；
+- 崩溃场景：SQLite 自动回滚未提交事务，上次已提交月份为有效存档。
+
+---
+
+## 10. 配置系统
+
+### 10.1 加载与校验
+
+- 所有 YAML 通过 `internal/config/embed.go` 的 `embed.FS` 打包进二进制；
+- `-config` 参数可指定外部目录覆盖内嵌配置（预留）；
+- 启动时执行：
+  1. YAML 解析；
+  2. 字段类型与取值范围校验；
+  3. ID 唯一性校验；
+  4. 引用完整性校验（功法引用的灵根元素存在、事件引用的模板存在等）；
+  5. 地图 Region 覆盖校验（每格恰好属于一个 Region）；
+  6. 校验失败直接终止启动并打印错误位置。
+
+### 10.2 `configs/world.yaml`
+
+```yaml
+map:
+  width: 64
+  height: 64
+  seed: 20250101
+  auto_generate: false        # 第一版只按 regions 生成；true 为后续随机生成预留
+  player_start: {x: 12, y: 8}
+
+regions:
+  - id: qingyun_foothill
+    name: 青云山脚
+    kind: normal              # normal | city | cultivation | ruin
+    shape: {type: rect, x: 0, y: 0, w: 64, h: 24}
+    aura_base: 10
+    danger: 1
+    enterable: true
+    min_realm: lianqi
+    events: []                # 区域事件模板 ID（第一版可空）
+
+  - id: cuizhu_forest
+    name: 翠竹林
+    kind: cultivation
+    shape: {type: rect, x: 0, y: 24, w: 40, h: 20}
+    aura_base: 25
+    danger: 2
+    enterable: true
+    min_realm: lianqi
+
+  - id: lingquan_cave
+    name: 灵泉洞
+    kind: cultivation
+    shape: {type: circle, cx: 20, cy: 44, r: 8}
+    aura_base: 50
+    danger: 4
+    enterable: true
+    min_realm: lianqi
+
+tile_modifiers: {}            # {(x,y): 倍率}，默认 1.0；第一版可空
+```
+
+### 10.3 `configs/actions.yaml`
+
+```yaml
+actions:
+  move:
+    kind: physical
+    duration_days: 3
+    interruptible: true
+  cultivate:
+    kind: physical
+    duration_days: 30
+    interruptible: true
+  breakthrough:
+    kind: physical
+    duration_days: 7
+    interruptible: false
+  entertain:
+    kind: physical
+    duration_days: 3
+    interruptible: true
+  hunt:
+    kind: physical
+    duration_days: 15
+    interruptible: true
+  gather:
+    kind: physical
+    duration_days: 5
+    interruptible: true
+  emotion_generic:
+    kind: emotion
+    duration_days: 0
+    interruptible: false
+```
+
+### 10.4 `configs/realms.yaml`
+
+```yaml
+realms:
+  - id: lianqi
+    name: 炼气
+    order: 0
+    stages: [初期, 中期, 后期, 圆满]
+    base_lifespan_years: 100
+  - id: zhuji
+    name: 筑基
+    order: 1
+    stages: [初期, 中期, 后期, 圆满]
+    base_lifespan_years: 200
+  - id: jindan
+    name: 金丹
+    order: 2
+    stages: [初期, 中期, 后期, 圆满]
+    base_lifespan_years: 400
+  - id: yuanying
+    name: 元婴
+    order: 3
+    stages: [初期, 中期, 后期, 圆满]
+    base_lifespan_years: 800
+
+breakthrough:
+  base_probability: 0.6
+  weights:
+    linggen: 0.20
+    technique: 0.10
+    lifespan_remaining_ratio: 0.20
+    aura: 0.20
+    mood: 0.10
+    item: 0.20
+  failure:
+    progress_loss_percent: 10
+    injury_days: 30
+    cooldown_days: 5
+    lifespan_loss_days: 360     # 大境界突破失败 -1 年
+```
+
+### 10.5 `configs/techniques.yaml`（5 本占位功法）
+
+```yaml
+techniques:
+  - {id: tuna_shu,     name: 吐纳术, speed: 1.0, breakthrough_bonus: 0.00}
+  - {id: qingyun_jue,  name: 青云诀, speed: 1.2, breakthrough_bonus: 0.03}
+  - {id: ningyuan_gong,name: 凝元功, speed: 1.4, breakthrough_bonus: 0.05}
+  - {id: hunyuan_jing, name: 混元经, speed: 1.6, breakthrough_bonus: 0.07}
+  - {id: taixu_yin,    name: 太虚引, speed: 1.8, breakthrough_bonus: 0.10}
+```
+
+### 10.6 `configs/spirit_roots.yaml`
+
+```yaml
+elements: [metal, wood, water, fire, earth]
+generation:
+  method: random_dirichlet   # 随机占比，总和 100
+  concentration: 2.0
+affinity:
+  cultivate_speed_weight: 1.0
+  breakthrough_weight: 1.0
+```
+
+### 10.7 `configs/animals.yaml` / `configs/plants.yaml`
+
+每种实体字段模板：
+
+```yaml
+animals:
+  - id: wild_rabbit
+    name: 野兔
+    tier: 1
+    danger: 1
+    hunt_min_realm: lianqi
+    hunt_success_base: 0.8
+    drops:
+      - {item: rabbit_fur, weight: 80, qty_min: 1, qty_max: 2}
+      - {item: spirit_stone, weight: 5, qty_min: 1, qty_max: 3}
+    respawn_days: 90
+    sprite: animals/wild_rabbit.png
+
+plants:
+  - id: ling_cao
+    name: 灵草
+    tier: 1
+    stage_days: {seedling: 90, mature: 180, wither: 360}
+    gather_min_realm: lianqi
+    gather_success_base: 0.9
+    drops:
+      - {item: ling_cao, weight: 100, qty_min: 1, qty_max: 3}
+    respawn_days: 180
+    sprite: plants/ling_cao.png
+```
+
+第一版默认提供 20 种动物、20 种植物（示例见附录 B），用户可按需增删。
+
+### 10.8 `configs/events.yaml`
+
+```yaml
+world_events:
+  - id: spirit_tide
+    name: 灵潮爆发
+    period_months: 6          # 第一版固定每 6 个月
+    effects:
+      - {type: all_regions_aura_mult, value: 1.5, duration_months: 3}
+    result_text: "天地灵气涌动，全图灵气暂时提升。"
+
+tile_events: []              # 地块到达事件，v0.3 填充
+```
+
+### 10.9 `configs/ai.yaml`
+
+```yaml
+npc:
+  initial_count: 30
+  max_count: 100
+  birth_probability_per_year: 0.10
+rule_ai:
+  decision_interval_months: 1
+  action_weights:
+    cultivate:    {base: 50, caution: 0.0, benevolence: 0.0, solitude: 0.3, greed: -0.1, tenacity: 0.2}
+    move:         {base: 20, caution: 0.2, benevolence: 0.0, solitude: 0.0, greed: 0.0, tenacity: 0.0}
+    entertain:    {base: 15, caution: 0.0, benevolence: 0.1, solitude: -0.2, greed: 0.0, tenacity: 0.0}
+    hunt:         {base: 10, caution: -0.2, benevolence: -0.1, solitude: 0.0, greed: 0.2, tenacity: 0.1}
+    gather:       {base: 5,  caution: 0.0, benevolence: 0.0, solitude: 0.2, greed: 0.0, tenacity: 0.0}
+  breakthrough_when_ready: true
+  move_if_aura_below: 10
+```
+
+### 10.10 `configs/llm.yaml`
+
+```yaml
+enabled: false                 # 第一版默认关闭
+provider: deepseek
+base_url: https://api.deepseek.com
+api_key_env: DEEPSEEK_API_KEY  # 密钥只从环境变量读取
+model: deepseek-chat
+timeout_seconds: 30
+max_calls_per_npc_per_month: 5
+max_chain_length: 3
+fallback: rule                 # 失败回退规则 AI
+```
+
+---
+
+## 11. IO、名称、图片、LLM 文件规范
+
+### 11.1 IO 文件
+
+- 文件：`internal/io/textfile.go`
+- 职责边界：**只负责读取 UTF-8 文本文件**，不负责存档读写（存档在 `store` 包）；
+- 功能：
+  - 读入并去掉 BOM；
+  - 每行去空白，忽略空行与 `#` 注释行；
+  - 去重；
+  - 非 UTF-8 或空文件报错；
+  - 返回 `[]string`。
+
+### 11.2 名称文件
+
+| 文件 | 内容 | 示例 |
+|---|---|---|
+| `assets/names/surnames.txt` | 姓氏表，每行一个 | 赵、钱、孙、李、陈、林 |
+| `assets/names/male_names.txt` | 男性名表 | 青玄、子昂、无尘 |
+| `assets/names/female_names.txt` | 女性名表 | 若雪、清瑶、素心 |
+
+- NPC 出生时按性别随机 `姓 + 名`；
+- 姓名查重：第一版不强制唯一，通过 ID 区分人物。
+
+### 11.3 图片文件
+
+- 第一版**不加载任何图片**；
+- 配置中所有实体预留 `sprite` 字符串字段；
+- `assets/sprites/` 目录与 `README.md` 预留，后续图形化时按 `sprite` 键查找资源。
+
+### 11.4 LLM 文件
+
+- 文件：`internal/llmclient/deepseek.go`
+- 三个提示词模板：
+  1. `system_prompt.txt`：世界规则、NPC 人设、输出 JSON 格式；
+  2. `action_chain_prompt.txt`：生成动作链；
+  3. `emergent_event_prompt.txt`：突发状况响应。
+- 模板占位符：`{{name}}`、`{{gender}}`、`{{personality}}`、`{{realm}}`、`{{options}}`、`{{event}}`；
+- LLM 输出约定：
+
+```json
+{"actions":[{"type":"cultivate","params":{},"reason":"灵气充足，闭关修炼"}]}
+```
+
+- 返回动作必须全部通过 `CanExecute`；非法动作丢弃并记 `llm_audit_log`；
+- 第一版 `llm.enabled=false`，实现接口与 Mock，不实际联网。
+
+---
+
+## 12. 数据库设计
+
+### 12.1 基础设置
+
+- 文件：`data/save.db`（路径可由 `-db` 指定）；
+- 连接即执行：
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = FULL;
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+```
+
+- 动态属性一律存 JSON 文本列，应用层负责序列化/反序列化；
+- 未来迁移 PostgreSQL 时，JSON 列可平滑替换为 JSONB，无需改业务结构。
+
+### 12.2 建表 DDL（v1 全量）
+
+```sql
+-- 迁移记录
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version     INTEGER PRIMARY KEY,
+    description TEXT NOT NULL,
+    applied_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ID 序号
+CREATE TABLE IF NOT EXISTS id_counters (
+    kind      TEXT PRIMARY KEY,          -- P / N / A / T / I
+    next_seq  INTEGER NOT NULL DEFAULT 1
+);
+
+-- 世界状态（单行，id 恒为 1）
+CREATE TABLE IF NOT EXISTS world_state (
+    id                     INTEGER PRIMARY KEY CHECK (id = 1),
+    day_index              INTEGER NOT NULL DEFAULT 0,
+    schema_version         INTEGER NOT NULL DEFAULT 1,
+    map_seed               INTEGER NOT NULL DEFAULT 1,
+    map_config_hash        TEXT NOT NULL DEFAULT '',
+    checkpoint_day_index   INTEGER NOT NULL DEFAULT 0,
+    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at             TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 人物（玩家 + NPC）
+CREATE TABLE IF NOT EXISTS persons (
+    id                  TEXT PRIMARY KEY,
+    kind                TEXT NOT NULL CHECK (kind IN ('player','npc')),
+    name                TEXT NOT NULL,
+    gender              TEXT NOT NULL CHECK (gender IN ('male','female')),
+    birth_day_index     INTEGER NOT NULL,
+    age_days            INTEGER NOT NULL DEFAULT 0,
+    alive               INTEGER NOT NULL DEFAULT 1 CHECK (alive IN (0,1)),
+    death_day_index     INTEGER,
+    pos_x               INTEGER NOT NULL,
+    pos_y               INTEGER NOT NULL,
+    realm_id            TEXT NOT NULL DEFAULT 'lianqi',
+    stage_index         INTEGER NOT NULL DEFAULT 0 CHECK (stage_index BETWEEN 0 AND 3),
+    progress_percent    REAL NOT NULL DEFAULT 0 CHECK (progress_percent >= 0 AND progress_percent <= 100),
+    technique_id        TEXT,
+    base_lifespan_days  INTEGER NOT NULL DEFAULT 36000,
+    mood                REAL NOT NULL DEFAULT 80 CHECK (mood >= 0 AND mood <= 100),
+    spirit_root_json    TEXT NOT NULL DEFAULT '{}',
+    personality_json    TEXT NOT NULL DEFAULT '{}',
+    status_json         TEXT NOT NULL DEFAULT '{}',
+    extra_json          TEXT NOT NULL DEFAULT '{}',
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_persons_alive   ON persons(alive);
+CREATE INDEX IF NOT EXISTS idx_persons_pos     ON persons(pos_x, pos_y);
+CREATE INDEX IF NOT EXISTS idx_persons_kind    ON persons(kind);
+
+-- 动作队列（等待/进行中）
+CREATE TABLE IF NOT EXISTS action_queue (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id         TEXT NOT NULL REFERENCES persons(id),
+    seq               INTEGER NOT NULL DEFAULT 0,
+    action_type       TEXT NOT NULL,
+    params_json       TEXT NOT NULL DEFAULT '{}',
+    total_days        INTEGER NOT NULL DEFAULT 0,
+    elapsed_days      INTEGER NOT NULL DEFAULT 0,
+    state             TEXT NOT NULL DEFAULT 'waiting'
+                      CHECK (state IN ('waiting','running','done','cancelled','interrupted')),
+    created_day_index INTEGER NOT NULL,
+    started_day_index INTEGER,
+    finished_day_index INTEGER,
+    result_json       TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (person_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_queue_person ON action_queue(person_id, seq);
+
+-- 动作历史（每人物只保留最近 5 条；全量轨迹在 event_log）
+CREATE TABLE IF NOT EXISTS action_history (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id         TEXT NOT NULL REFERENCES persons(id),
+    action_type       TEXT NOT NULL,
+    params_json       TEXT NOT NULL DEFAULT '{}',
+    result_json       TEXT NOT NULL DEFAULT '{}',
+    started_day_index INTEGER NOT NULL,
+    finished_day_index INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_history_person ON action_history(person_id, finished_day_index);
+
+-- 延寿事件字典（寿命变更的唯一权威记录）
+CREATE TABLE IF NOT EXISTS lifespan_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id           TEXT NOT NULL REFERENCES persons(id),
+    effective_day_index INTEGER NOT NULL,
+    days_added          INTEGER NOT NULL,     -- 正数延寿、负数减寿
+    reason              TEXT NOT NULL,        -- breakthrough / item / event / gm
+    source_type         TEXT,
+    source_id           TEXT,
+    note                TEXT NOT NULL DEFAULT '',
+    created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_lifespan_person ON lifespan_events(person_id, effective_day_index);
+
+-- 动物
+CREATE TABLE IF NOT EXISTS animals (
+    id               TEXT PRIMARY KEY,
+    species_id       TEXT NOT NULL,
+    pos_x            INTEGER NOT NULL,
+    pos_y            INTEGER NOT NULL,
+    alive            INTEGER NOT NULL DEFAULT 1 CHECK (alive IN (0,1)),
+    age_days         INTEGER NOT NULL DEFAULT 0,
+    death_day_index  INTEGER,
+    respawn_day_index INTEGER,
+    attrs_json       TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_animals_pos   ON animals(pos_x, pos_y);
+CREATE INDEX IF NOT EXISTS idx_animals_alive ON animals(alive);
+
+-- 植物
+CREATE TABLE IF NOT EXISTS plants (
+    id               TEXT PRIMARY KEY,
+    species_id       TEXT NOT NULL,
+    pos_x            INTEGER NOT NULL,
+    pos_y            INTEGER NOT NULL,
+    stage            TEXT NOT NULL DEFAULT 'seedling'
+                     CHECK (stage IN ('seedling','mature','withered')),
+    stage_days       INTEGER NOT NULL DEFAULT 0,
+    alive            INTEGER NOT NULL DEFAULT 1 CHECK (alive IN (0,1)),
+    respawn_day_index INTEGER,
+    attrs_json       TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_plants_pos   ON plants(pos_x, pos_y);
+CREATE INDEX IF NOT EXISTS idx_plants_alive ON plants(alive);
+
+-- 物品实例
+CREATE TABLE IF NOT EXISTS items (
+    id               TEXT PRIMARY KEY,
+    template_id      TEXT NOT NULL,
+    owner_id         TEXT REFERENCES persons(id),
+    quantity         INTEGER NOT NULL DEFAULT 1 CHECK (quantity >= 1),
+    stackable        INTEGER NOT NULL DEFAULT 1 CHECK (stackable IN (0,1)),
+    attrs_json       TEXT NOT NULL DEFAULT '{}',
+    acquired_day_index INTEGER NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_items_owner ON items(owner_id);
+
+-- 灵石（独立货币）
+CREATE TABLE IF NOT EXISTS spirit_stones (
+    person_id  TEXT PRIMARY KEY REFERENCES persons(id),
+    amount     INTEGER NOT NULL DEFAULT 0 CHECK (amount >= 0),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 事件日志（个人/地块/区域/世界）
+CREATE TABLE IF NOT EXISTS event_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    day_index   INTEGER NOT NULL,
+    scope       TEXT NOT NULL CHECK (scope IN ('person','tile','region','world')),
+    event_type  TEXT NOT NULL,
+    tile_x      INTEGER,
+    tile_y      INTEGER,
+    region_id   TEXT,
+    person_id   TEXT,
+    template_id TEXT,
+    params_json TEXT NOT NULL DEFAULT '{}',
+    result_text TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_day    ON event_log(day_index);
+CREATE INDEX IF NOT EXISTS idx_event_person ON event_log(person_id, day_index);
+CREATE INDEX IF NOT EXISTS idx_event_scope  ON event_log(scope, day_index);
+
+-- Region 运行态覆盖（世界事件改灵气等）
+CREATE TABLE IF NOT EXISTS region_states (
+    region_id         TEXT PRIMARY KEY,
+    aura_override     REAL,
+    flags_json        TEXT NOT NULL DEFAULT '{}',
+    updated_day_index INTEGER NOT NULL
+);
+
+-- LLM 调用审计（v0.4 启用）
+CREATE TABLE IF NOT EXISTS llm_audit_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    day_index     INTEGER NOT NULL,
+    npc_id        TEXT NOT NULL,
+    prompt_hash   TEXT NOT NULL,
+    request_json  TEXT NOT NULL DEFAULT '{}',
+    response_json TEXT NOT NULL DEFAULT '{}',
+    validated     INTEGER NOT NULL DEFAULT 0 CHECK (validated IN (0,1)),
+    error_text    TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+### 12.3 存档安全与备份
+
+| 措施 | 说明 |
+|---|---|
+| WAL | 崩溃后保留最后一个已提交检查点 |
+| synchronous=FULL | 每次提交落盘 |
+| 单事务结算 | 一次移动=一个事务，要么全生效要么全不生效 |
+| 启动备份 | 打开数据库前，把上次 `save.db` 复制为 `data/backups/save-<时间戳>.db` |
+| 定期备份 | 每 12 个游戏月检查点后，调用 `VACUUM INTO` 生成备份 |
+| 备份保留 | 最近 20 份，自动清理更早备份 |
+| 完整性检查 | 启动时执行 `PRAGMA integrity_check`，失败则提示从备份恢复并拒绝启动 |
+| 配置哈希 | `world_state.map_config_hash` 记录生成地图的配置哈希，配置变更时告警并先备份 |
+
+### 12.4 数据恢复
+
+```text
+1. 停止程序；
+2. 从 data/backups/ 选择最近备份；
+3. 用备份文件覆盖 data/save.db（同时删除 -wal、-shm 文件）；
+4. 重新启动，程序执行 integrity_check 后继续。
+```
+
+---
+
+## 13. HTTP API 与 GM 权限（本版范围）
+
+### 13.1 GM 需求
+
+用户明确要求“需要更改数据的权限”。第一版提供：
+
+- 终端 GM 菜单（默认隐藏，按 `G` 进入，要求本地管理口令或开发模式）；
+- HTTP GM 接口在 `-http` 模式开放（v0.5 实施），需要请求头 `X-Admin-Token`。
+
+### 13.2 GM 命令清单
+
+| 命令 | 参数 | 说明 |
+|---|---|---|
+| `add_cultivation` | `points` | 增加当前小层修为百分比 |
+| `set_realm` | `realm_id, stage_index` | 设置境界与小层 |
+| `set_progress` | `percent` | 设置修为进度 |
+| `add_lifespan` | `days` | 延寿/减寿（写 lifespan_events） |
+| `set_age` | `days` | 设置年龄 |
+| `set_mood` | `value` | 设置心情 |
+| `teleport` | `x, y` | 传送（必须合法且可进入） |
+| `add_spirit_stones` | `amount` | 增减灵石 |
+| `give_item` | `template_id, quantity` | 发放物品 |
+| `spawn_npc` | `name?` | 生成 NPC |
+| `advance` | `months` | 模拟器直接推进 N 个月（不移动） |
+| `force_save` | - | 立即检查点 |
+| `backup` | - | 立即备份 |
+| `list_events` | `scope, limit` | 查询事件日志 |
+| `reset_world` | `confirm` | 删除存档重新生成世界 |
+| `show_state` | - | 输出完整世界状态 |
+
+### 13.3 权限规则
+
+- GM 修改同样走模拟器 Command 通道，由模拟器统一结算，不允许绕过；
+- 所有 GM 修改写 `event_log`（`event_type=gm`）；
+- 灵根：GM 只能在新建人物时指定，运行中修改被拒绝。
+
+---
+
+## 14. 错误处理、日志与可观测性
+
+- 所有错误用 Go `error` 包装，携带上下文（如 `config realms.yaml: unknown technique id: xxx`）；
+- 模拟器结算错误：事务回滚 + `slog.Error` + 返回调用方，进程不崩溃；
+- 配置错误：启动即失败，打印具体文件与字段；
+- 数据库错误：停止本次结算，必要时进入只读保护模式；
+- 运行日志输出 stdout，可选写 `data/logs/game.log`；
+- 所有世界变化写 `event_log`，关键操作（突破、死亡、延寿、GM）必须落库后才能向前端展示成功。
+
+---
+
+## 15. 测试方案
+
+### 15.1 单元测试
+
+| 模块 | 用例 |
+|---|---|
+| gametime | 年月日与 day_index 互转、跨年跨月、加减天数 |
+| world/shape | rect/circle/polygon 的 Contains 与边界 |
+| world/generation | 每格恰好一个 Region、无覆盖空洞、配置错误报错 |
+| idgen | 重启后序号连续、前缀正确 |
+| namegen | 随机姓名格式、空表报错 |
+| config | 引用完整性、取值范围、未知字段 |
+| action | 进度百分比、未到 100% 不结算 |
+| cultivation | 小层自动晋升、突破公式 clamp、失败惩罚 |
+| lifespan | 延寿事件求和、死亡判定顺序 |
+| item | 堆叠规则、灵石非负 |
+
+### 15.2 模拟器集成测试（固定种子）
+
+1. **一步一月**：移动一次后世界时间恰好 +1 个月；
+2. **动作推进**：移动动作 3 天完成、坐标更新、剩余 27 天分给下一动作；
+3. **修炼结算**：修炼 30 天整月完成，修为只加一次；
+4. **突破延寿不误死**：角色剩余 1 天寿命时，第 1 天突破成功加寿元，当日不死；
+5. **月中死亡**：角色第 3 天死亡，第 1-2 天已完成动作保留，第 5 天动作被中断；
+6. **延寿字典**：先减寿后延寿按生效日顺序结算，死亡检查使用正确值；
+7. **世界事件**：第 6、12、18 个月触发；
+8. **NPC 出生**：年末按概率出生且不超过 100 上限；
+9. **动物植物**：每日移动/生长、采集成熟株、狩猎重生；
+10. **存档恢复**：结算后强制退出，重启后 `day_index`、队列进度、实体位置完全一致；
+11. **事务回滚**：注入第 20 天数据库错误，确认整月回滚、内存状态恢复；
+12. **GM**：GM 修改写事件日志、非法传送被拒绝。
+
+### 15.3 验收冒烟命令
+
+```bash
+cd /home/wyh/project/MyGame
+go test ./...
+go run ./cmd/game
+# 终端内依次验证：查看状态 → 移动 → 世界+1月 → 入队修炼 → 再移动 → 修为增加
+```
+
+---
+
+## 16. 实施清单（按版本迭代）
+
+### v0.1 世界骨架与“一步一月”闭环
+
+**目标：能创建人物、在地图上移动、世界按月结算、老死判定、存档恢复。**
+
+| 任务 | 交付物 | 验收标准 |
+|---|---|---|
+| 初始化 Go 项目 | `go.mod`、目录骨架 | `go build ./...` 通过 |
+| gametime 包 | Year/Month/Day/Timestamp/Calendar | 单测通过 |
+| world 包 | Tile/Region/Shape/Map/generation | YAML 生成 64×64，无空洞 |
+| config 包 | 全部 YAML 结构体 + loader + validate | 坏配置启动即失败 |
+| io + namegen | txt 读取、随机姓名 | 中英文姓名正常 |
+| idgen | 五种 ID 生成 | 重启连续 |
+| person 基础 | 人物字段、出生、历史 5 条 | 玩家初始创建成功 |
+| action 接口 | Action/Queue/registry | 新动作可注册 |
+| simulator | AdvanceOneStep 月/日循环、死亡最后、单事务 | 集成用例 1-6、11 通过 |
+| lifespan | 延寿字典与死亡判定 | 用例 5、6 通过 |
+| store | 迁移、仓储、备份 | 重启存档一致 |
+| frontend | 终端菜单 + 10×10 ASCII 地图 | 可交互移动 |
+
+### v0.2 修炼与突破
+
+| 任务 | 交付物 | 验收标准 |
+|---|---|---|
+| cultivation 包 | Realm/LingGen/Technique/formula | 灵根占比校验通过 |
+| cultivate 动作 | 30 天修炼、100% 结算、灵气/心情/功法加成 | 修为按配置增长 |
+| breakthrough 动作 | 7 天突破、公式、成功/失败、冷却、轻伤 | 成功升大境界并延寿；失败减寿 |
+| 小层晋升 | 进度满自动晋升 | 4 小层顺序正确 |
+| 延寿联动 | 突破成功写 lifespan_events | 突破当天不死 |
+| 5 本功法 | 配置加载与选择 | 速度/突破加成生效 |
+
+### v0.3 其余动作与生态
+
+| 任务 | 交付物 | 验收标准 |
+|---|---|---|
+| entertain/emotion | 娱乐 + 情绪动作 | 心情/性格正确变化 |
+| hunt/gather | 狩猎、采集 | 掉落、灵石、失败分支正确 |
+| item 包 | 模板/实例/堆叠/JSON 词条 | 物品发放与消耗正确 |
+| spiritstone | 独立货币 | 非负、掉落、GM 增减 |
+| ecology | 20 动物/20 植物配置、每日移动/生长 | 阶段推进、重生正确 |
+| 地块事件 | 到达触发 Region/Tile 事件 | 事件日志正确 |
+
+### v0.4 NPC 与 AI
+
+| 任务 | 交付物 | 验收标准 |
+|---|---|---|
+| personality | 五维生成与事件修改 | 范围 0-100 |
+| 规则 AI | 每月决策、性格权重、突破/移动策略 | NPC 可自主修炼突破 |
+| 人口系统 | 年末出生、100 上限、死亡移除 | 人口曲线合理 |
+| DeepSeek 客户端 | `llm.yaml` + 提示词 + 异步调用 | `enabled=false` 时零网络请求 |
+| LLM 动作链 | JSON 解析 + CanExecute 校验 + 回退 | 非法动作被丢弃 |
+| 突发状况 | 世界事件触发 LLM 提案 | 校验通过才执行 |
+
+### v0.5 GM、HTTP 与收尾
+
+| 任务 | 交付物 | 验收标准 |
+|---|---|---|
+| GM 终端菜单 | 第 13.2 节全部命令 | 修改有权限、有日志 |
+| HTTP API | `-http` 模式 + `/api/state`、`/api/command` | curl 可读状态、发指令 |
+| HTTP GM | `X-Admin-Token` + 管理接口 | 无 token 拒绝 |
+| 事件查询 | `list_events` 终端/HTTP | 可按 scope 过滤 |
+| 文档 | README、运行说明、配置说明 | 新手可按文档跑通 |
+| 全量测试 | 15 节用例 | `go test ./...` 全绿 |
+
+---
+
+## 17. 验收标准（本版完成定义）
+
+- [ ] `go run ./cmd/game` 在 VSCode 中可直接启动；
+- [ ] 玩家移动一格，世界时间恰好推进一个月，事件按第 9 节顺序结算；
+- [ ] 移动、突破、娱乐、修炼、狩猎、采集六类实际动作 + 情绪动作全部注册且可执行判定正确；
+- [ ] 动作进度未到 100% 不产生效果；
+- [ ] 延寿事件字典按生效日参与死亡判定，死亡永远是当天最后判定；
+- [ ] 玩家寿终保留存档，可 GM 回滚；
+- [ ] SQLite 开启 WAL/FULL，一次移动一个事务，备份可恢复；
+- [ ] 重启进程后世界时间、人物、队列、动物、植物、物品完全一致；
+- [ ] 所有 YAML 配置通过校验，所有动态属性走 JSON 列；
+- [ ] 20 种动物、20 种植物可从配置文件增删；
+- [ ] NPC 规则 AI 每月决策，人口不超上限；
+- [ ] DeepSeek 配置默认关闭，接口可异步调用并校验动作；
+- [ ] GM 修改有权限控制并写事件日志；
+- [ ] `go test ./...` 全部通过。
+
+---
+
+## 18. 后续扩展预留（不实现，只留口子）
+
+| 未来功能 | 预留方式 |
+|---|---|
+| 动画/小程序/2D | 前端接口 + `sprite` 字段 + HTTP API |
+| 多玩家/PVP | ID 体系、Command 通道天然支持多请求源 |
+| 登录 | `persons.kind=player` 外接账号表即可 |
+| 离线收益 | `world_state` 加 `last_real_seen_at`，按 `time_scale` 补算 |
+| ECS 化 | 如 Person 属性爆炸，把灵根/寿命/背包拆为组件，保持领域方法不变 |
+| Mongo/PG/Redis | JSON 列 → JSONB；store 接口化替换驱动 |
+| 战斗系统 | 新增 `Combat` 动作与结算系统，动作注册表直接扩展 |
+| 任务系统 | 地块事件模板加 `quest` 类型 |
+| 动物繁衍 | animals 表加 `gender/partner_id` 字段 |
+| 配置热更 | config 加版本号与安全重载白名单 |
+
+---
+
+## 附录 A：第一版默认数值总表
+
+| 参数 | 默认值 |
+|---|---|
+| 地图 | 64×64 |
+| 时间 | 1年=12月，1月=30天 |
+| 移动 | 3 天/格，触发 1 个月结算 |
+| 修炼 | 30 天，完成才结算修为 |
+| 突破 | 7 天；基础成功率 0.6 |
+| 娱乐 | 3 天 |
+| 狩猎 | 15 天 |
+| 采集 | 5 天 |
+| 情绪动作 | 0 天，即时 |
+| 境界 | 炼气→筑基→金丹→元婴；各 4 小层 |
+| 基础寿元 | 100/200/400/800 年 |
+| 突破失败 | 修为-10%、轻伤30天、冷却5天、减寿1年 |
+| 灵根 | 五行占比，总和 100 |
+| 性格 | 谨慎/仁善/孤僻/贪婪/坚韧，各 0-100 |
+| NPC | 初始 30，上限 100 |
+| 世界事件 | 每 6 个月一次 |
+| 动作历史 | 每人显示最近 5 条 |
+| 心情 | 0-100，默认 80 |
+| 备份 | 启动备份 + 每 12 游戏月备份，保留 20 份 |
+| 存档 | 单存档 `data/save.db` |
+
+---
+
+## 附录 B：20 种动物与 20 种植物初始配置建议
+
+### 动物（可按需删改）
+
+| id | 名称 | tier | danger | 主要掉落 |
+|---|---|---|---|---|
+| wild_rabbit | 野兔 | 1 | 1 | 兔皮、少量灵石 |
+| pheasant | 山鸡 | 1 | 1 | 鸡羽 |
+| wild_boar | 野猪 | 1 | 2 | 兽皮、獠牙 |
+| fox | 狐狸 | 1 | 1 | 狐皮 |
+| deer | 鹿 | 1 | 1 | 鹿角、兽皮 |
+| wolf | 狼 | 2 | 3 | 狼皮、狼牙 |
+| bear | 熊 | 2 | 4 | 熊皮、熊胆 |
+| snake | 蛇 | 1 | 2 | 蛇胆 |
+| eagle | 鹰 | 2 | 3 | 鹰羽、鹰爪 |
+| monkey | 猴 | 1 | 1 | 猴儿酒（稀有） |
+| carp | 鲤鱼 | 1 | 1 | 鱼鳞 |
+| tortoise | 龟 | 1 | 1 | 龟甲 |
+| crane | 鹤 | 2 | 2 | 鹤羽 |
+| spirit_rabbit | 灵兔 | 2 | 1 | 灵兔毛 |
+| spirit_deer | 灵鹿 | 3 | 2 | 鹿茸、灵血 |
+| spirit_crane | 灵鹤 | 3 | 2 | 灵鹤羽 |
+| demon_wolf | 妖狼 | 4 | 5 | 妖丹（稀有） |
+| demon_snake | 妖蛇 | 4 | 5 | 妖丹（稀有） |
+| red_fox | 赤狐 | 3 | 3 | 赤狐尾 |
+| white_ape | 白猿 | 4 | 4 | 白猿骨、灵果 |
+
+### 植物（可按需删改）
+
+| id | 名称 | tier | 阶段天数（幼苗/成熟/枯萎） | 主要产物 |
+|---|---|---|---|---|
+| ling_cao | 灵草 | 1 | 90/180/360 | 灵草 |
+| huichun_cao | 回春草 | 1 | 90/180/360 | 回春草（疗伤） |
+| juling_hua | 聚灵花 | 2 | 180/360/720 | 聚灵花粉 |
+| ironwood | 铁木 | 1 | 180/360/720 | 铁木 |
+| qingzhu | 青竹 | 1 | 120/300/600 | 青竹 |
+| zhuguo | 朱果 | 4 | 360/720/1440 | 朱果（突破材料） |
+| xueshen | 血参 | 3 | 270/540/1080 | 血参 |
+| lingzhi | 灵芝 | 3 | 270/540/1080 | 灵芝 |
+| yuejian_cao | 月见草 | 2 | 180/360/720 | 月见草 |
+| zisu | 紫苏 | 1 | 60/150/300 | 紫苏 |
+| hanyan_cao | 寒烟草 | 2 | 180/360/720 | 寒烟草 |
+| shihu | 石斛 | 2 | 150/300/600 | 石斛 |
+| fuling | 茯苓 | 2 | 180/360/720 | 茯苓 |
+| huangjing | 黄精 | 1 | 120/240/480 | 黄精 |
+| tianma | 天麻 | 2 | 180/360/720 | 天麻 |
+| xuelian | 雪莲 | 4 | 360/720/1440 | 雪莲 |
+| longdan | 龙胆 | 2 | 150/300/600 | 龙胆 |
+| gouqi | 枸杞 | 1 | 120/240/480 | 枸杞 |
+| heshouwu | 何首乌 | 3 | 270/540/1080 | 何首乌 |
+| biluo_teng | 碧罗藤 | 3 | 270/540/1080 | 碧罗藤 |
+
+> 以上数值均为初始占位配置，最终以 `configs/animals.yaml` 与 `configs/plants.yaml` 为准。
+
+---
+
+## 附录 C：事件类型枚举（第一版）
+
+| event_type | scope | 触发时机 |
+|---|---|---|
+| move | person | 移动动作完成 |
+| cultivate | person | 修炼动作完成 |
+| breakthrough_success | person | 突破成功 |
+| breakthrough_fail | person | 突破失败 |
+| entertain | person | 娱乐完成 |
+| hunt_success / hunt_fail | person | 狩猎完成 |
+| gather_success / gather_fail | person | 采集完成 |
+| emotion | person | 情绪动作执行 |
+| birth | person | NPC 出生 |
+| death | person | 人物死亡 |
+| action_interrupted | person | 动作因死亡/中断取消 |
+| tile_arrive | tile | 到达新地块 |
+| world_event | world | 每 6 个月世界事件 |
+| gm | person/world | GM 修改 |
+
+---
+
+## 附录 D：关键运行命令
+
+```bash
+cd /home/wyh/project/MyGame
+
+# 初始化模块（首次）
+go mod init mygame
+go get modernc.org/sqlite
+go get gopkg.in/yaml.v3
+go mod tidy
+
+# 运行
+go run ./cmd/game
+
+# 测试
+go test ./...
+
+# 带 HTTP 模式
+go run ./cmd/game -http :8080
+
+# 查看存档
+sqlite3 data/save.db "select * from event_log order by id desc limit 20;"
+```
